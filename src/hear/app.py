@@ -13,24 +13,25 @@ from hear.config import config_manager
 from hear.debug import get_debug_info
 from hear.gemini import call_gemini_text, call_gemini_tts, get_api_key
 from hear.geo import compass_bearing_label, reverse_geocode_and_context
-from hear.models import (
-    AppConfig,
-    AssistantMessage,
+from hear.models.api import (
     ChatRequest,
     ChatResponse,
-    CurrentLocation,
-    GeminiContent,
-    GeminiPart,
-    LensSummary,
-    MessageLocation,
     NarrateRequest,
     NarrateResponse,
     PingRequest,
     PingResponse,
     ResetSessionResponse,
     StateResponse,
-    TriggerLocation,
     UpdateConfigResponse,
+)
+from hear.models.config import AppConfig
+from hear.models.gemini import GeminiContent, GeminiPart
+from hear.models.session import (
+    AssistantMessage,
+    CurrentLocation,
+    LensSummary,
+    MessageLocation,
+    TriggerLocation,
     UserChatMessage,
 )
 from hear.paths import AUDIO_DIR, STATIC_DIR, ensure_dirs

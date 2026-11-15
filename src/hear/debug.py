@@ -4,7 +4,7 @@ import subprocess
 import time
 from datetime import UTC, datetime
 
-from hear.models import DebugInfo
+from hear.models.session import DebugInfo
 from hear.paths import PROJECT_ROOT
 
 SERVER_START_EPOCH = time.time()

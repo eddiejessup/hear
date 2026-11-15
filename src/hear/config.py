@@ -2,7 +2,7 @@ from pathlib import Path
 
 import yaml
 
-from hear.models import AppConfig
+from hear.models.config import AppConfig
 from hear.paths import CONFIG_PATH
 
 

@@ -29,7 +29,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Run static analysis (ruff + ty)
-        run: ./check.sh
+        run: ./deploy/check.sh
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -43,4 +43,4 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           HEAR_AUTH_TOKEN: ${{ secrets.HEAR_AUTH_TOKEN }}
-        run: ./deploy.sh
+        run: ./deploy/deploy.sh

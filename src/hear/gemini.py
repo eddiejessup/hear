@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 from fastapi import HTTPException
 
-from hear.models import GeminiContent, GeminiTextResult, GroundingSource
+from hear.models.gemini import GeminiContent, GeminiTextResult, GroundingSource
 from hear.paths import AUDIO_DIR, PROJECT_ROOT
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"

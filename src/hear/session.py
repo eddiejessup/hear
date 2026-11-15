@@ -4,11 +4,10 @@ import time
 from datetime import UTC, datetime
 
 from hear.geo import haversine_meters
-from hear.models import (
-    AppConfig,
+from hear.models.config import AppConfig, LensConfig
+from hear.models.gemini import GeminiContent
+from hear.models.session import (
     CurrentLocation,
-    GeminiContent,
-    LensConfig,
     SessionTranscript,
     TriggerLocation,
     TriggerStatus,

@@ -3,7 +3,7 @@ import time
 
 import httpx
 
-from hear.models import GeoContext
+from hear.models.geo import GeoContext
 
 
 def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
