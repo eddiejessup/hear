@@ -8,7 +8,9 @@ import httpx
 from hear.models.geo import GeoContext
 
 _USER_AGENT = "HearWalkingCompanion/0.1 (personal-history-agent)"
+_NOMINATIM_FAILURE_BACKOFF_SECONDS = 15.0
 _http_client: httpx.AsyncClient | None = None
+_nominatim_backoff_until: float = 0.0
 
 
 def get_geo_http_client() -> httpx.AsyncClient:
@@ -40,11 +42,12 @@ def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
 
 
 def compass_bearing_label(heading: float | None) -> str | None:
-    if heading is None or math.isnan(heading) or heading < 0:
+    if heading is None or math.isnan(heading) or heading < 0 or heading > 360:
         return None
     dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
     idx = round(heading / 45.0) % 8
-    return f"{dirs[idx]} ({int(round(heading))}°)"
+    deg = int(round(heading)) % 360
+    return f"{dirs[idx]} ({deg}°)"
 
 
 @dataclass
@@ -66,12 +69,21 @@ class GeoCache:
         self._entries = [e for e in self._entries if (now - e.timestamp) < self.ttl_seconds]
 
     def find_close_entry(
-        self, lat: float, lon: float, max_dist_m: float = 25.0
+        self,
+        lat: float,
+        lon: float,
+        max_dist_m: float = 25.0,
+        *,
+        now: float | None = None,
     ) -> _CacheEntry | None:
-        now = time.time()
-        self._prune(now)
-        for entry in reversed(self._entries):
+        ts = now if now is not None else time.time()
+        self._prune(ts)
+        for idx in range(len(self._entries) - 1, -1, -1):
+            entry = self._entries[idx]
             if haversine_meters(lat, lon, entry.lat, entry.lon) <= max_dist_m:
+                if idx != len(self._entries) - 1:
+                    self._entries.pop(idx)
+                    self._entries.append(entry)
                 return entry
         return None
 
@@ -92,16 +104,14 @@ class GeoCache:
         max_dist_m: float = 25.0,
     ) -> GeoContext:
         now = time.time()
-        self._prune(now)
-        existing = self.find_close_entry(lat, lon, max_dist_m=max_dist_m)
+        existing = self.find_close_entry(lat, lon, max_dist_m=max_dist_m, now=now)
         if existing is not None:
             if existing.has_overpass and not has_overpass:
                 result = result.model_copy(
                     update={"nearby_features": existing.result.nearby_features}
                 )
                 has_overpass = True
-            existing.lat = lat
-            existing.lon = lon
+            # Keep existing.lat and existing.lon anchored at the originally geocoded point
             existing.result = result
             existing.has_overpass = has_overpass
             existing.timestamp = now
@@ -127,12 +137,16 @@ geo_cache = GeoCache()
 async def _fetch_nominatim(
     client: httpx.AsyncClient, lat: float, lon: float
 ) -> tuple[str, str, str, str, str, bool]:
+    global _nominatim_backoff_until
     short_label = f"{lat:.5f}, {lon:.5f}"
     full_address = short_label
     road = ""
     neighborhood = ""
     city = ""
     ok = False
+
+    if time.time() < _nominatim_backoff_until:
+        return short_label, full_address, road, neighborhood, city, False
 
     try:
         resp = await client.get(
@@ -188,6 +202,9 @@ async def _fetch_nominatim(
                 short_label = ", ".join(parts)
     except httpx.HTTPError, ValueError:
         pass
+
+    if not ok:
+        _nominatim_backoff_until = time.time() + _NOMINATIM_FAILURE_BACKOFF_SECONDS
 
     return short_label, full_address, road, neighborhood, city, ok
 

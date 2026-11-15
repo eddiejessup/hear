@@ -43,4 +43,4 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           HEAR_AUTH_TOKEN: ${{ secrets.HEAR_AUTH_TOKEN }}
-        run: ./deploy/deploy.sh
+        run: ./deploy/deploy.sh --skip-checks

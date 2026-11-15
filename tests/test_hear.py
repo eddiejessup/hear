@@ -1,16 +1,27 @@
+import asyncio
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+import httpx
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from hear.app import app
 from hear.auth import verify_token
-from hear.gemini import pcm_to_wav_bytes, prune_old_audio_files
-from hear.geo import GeoCache, compass_bearing_label, haversine_meters
-from hear.models.config import AppConfig, LensConfig, TriggersConfig
+from hear.config import ConfigManager
+from hear.gemini import call_gemini_text, pcm_to_wav_bytes, prune_old_audio_files
+from hear.geo import (
+    GeoCache,
+    _fetch_nominatim,
+    compass_bearing_label,
+    haversine_meters,
+)
+from hear.models.config import AppConfig, GeminiConfig, LensConfig, TriggersConfig
+from hear.models.gemini import GeminiContent, GeminiPart
 from hear.models.geo import GeoContext
 from hear.models.session import CurrentLocation, TriggerLocation
 from hear.session import SessionManager, WalkSession, sanitize_client_id
@@ -26,12 +37,14 @@ class TestGeoHelpers(unittest.TestCase):
     def test_compass_bearing(self) -> None:
         self.assertIsNone(compass_bearing_label(None))
         self.assertIsNone(compass_bearing_label(-5.0))
+        self.assertIsNone(compass_bearing_label(365.0))
         self.assertEqual(compass_bearing_label(0.0), "N (0°)")
+        self.assertEqual(compass_bearing_label(359.8), "N (0°)")
         self.assertEqual(compass_bearing_label(90.0), "E (90°)")
         self.assertEqual(compass_bearing_label(225.0), "SW (225°)")
 
     def test_geo_cache_upgrade_and_ttl(self) -> None:
-        cache = GeoCache(max_entries=4, ttl_seconds=60.0)
+        cache = GeoCache(max_entries=2, ttl_seconds=60.0)
         base_ctx = GeoContext(
             lat=51.5142,
             lon=-0.0885,
@@ -49,13 +62,38 @@ class TestGeoHelpers(unittest.TestCase):
         # Requiring overpass when entry doesn't have it -> cache miss
         self.assertIsNone(cache.get_if_close(51.51425, -0.0885, require_overpass=True))
 
-        # Upgrade with overpass features
+        # Upgrade with overpass features preserves original geocoded anchor coordinates
         upgraded_ctx = base_ctx.model_copy(update={"nearby_features": ["Royal Exchange"]})
         cache.set(51.51425, -0.0885, upgraded_ctx, has_overpass=True)
-        hit = cache.get_if_close(51.5142, -0.0885, require_overpass=True)
-        self.assertIsNotNone(hit)
-        assert hit is not None
-        self.assertEqual(hit.nearby_features, ["Royal Exchange"])
+        entry = cache.find_close_entry(51.5142, -0.0885)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertAlmostEqual(entry.lat, 51.5142)
+        self.assertEqual(entry.result.nearby_features, ["Royal Exchange"])
+
+        # Add a second entry far away, then touch the first entry so it becomes MRU
+        other_ctx = base_ctx.model_copy(update={"lat": 51.5200, "short_label": "Moorgate"})
+        cache.set(51.5200, -0.0885, other_ctx, has_overpass=True)
+        self.assertIsNotNone(cache.get_if_close(51.5142, -0.0885, require_overpass=True))
+
+        # Adding a third entry evicts the LRU (51.5200) and keeps the MRU (51.5142)
+        third_ctx = base_ctx.model_copy(update={"lat": 51.5300, "short_label": "Angel"})
+        cache.set(51.5300, -0.0885, third_ctx, has_overpass=True)
+        self.assertIsNotNone(cache.get_if_close(51.5142, -0.0885, require_overpass=True))
+        self.assertIsNone(cache.get_if_close(51.5200, -0.0885, require_overpass=True))
+
+    def test_nominatim_failure_backoff(self) -> None:
+        mock_client = AsyncMock()
+        mock_client.get.side_effect = httpx.ConnectError("Connection refused")
+        with patch("hear.geo._nominatim_backoff_until", 0.0):
+            res1 = asyncio.run(_fetch_nominatim(mock_client, 51.5142, -0.0885))
+            self.assertFalse(res1[5])
+            self.assertEqual(mock_client.get.call_count, 1)
+
+            # Immediate second call during 15s backoff window skips HTTP call
+            res2 = asyncio.run(_fetch_nominatim(mock_client, 51.5142, -0.0885))
+            self.assertFalse(res2[5])
+            self.assertEqual(mock_client.get.call_count, 1)
 
 
 class TestWalkSession(unittest.TestCase):
@@ -139,6 +177,77 @@ class TestWalkSession(unittest.TestCase):
         assert status_ready.trigger_reason is not None
         self.assertTrue(status_ready.trigger_reason.startswith("distance"))
 
+    def test_initial_location_respects_grace_window_after_opening_chat(self) -> None:
+        session = WalkSession("test_chat_first")
+        now = time.time()
+        session.current_location = CurrentLocation(
+            lat=51.5142,
+            lon=-0.0885,
+            short_label="Start",
+            full_address="Start",
+            timestamp=now,
+        )
+        # Simulate an opening chat turn before any narration (last_trigger_location is None)
+        session.last_trigger_time = now
+        session.last_audio_ended_at = now
+        status = session.compute_trigger_status(self.config)
+        self.assertFalse(status.should_trigger)
+        # Uses short 15s grace window instead of full 90s min_cooldown_seconds
+        self.assertGreater(status.cooldown_remaining_s, 0)
+        self.assertLessEqual(status.cooldown_remaining_s, 15.0)
+
+        # After 16s (well before 90s), initial_location is allowed to fire
+        session.last_trigger_time = now - 16.0
+        session.last_audio_ended_at = now - 16.0
+        status_after_grace = session.compute_trigger_status(self.config)
+        self.assertTrue(status_after_grace.should_trigger)
+        self.assertEqual(status_after_grace.trigger_reason, "initial_location")
+
+    def test_pause_hold_and_time_distance_expiry(self) -> None:
+        session = WalkSession("test_pause_hold")
+        now = time.time()
+        start_lat, start_lon = 51.5142, -0.0885
+        moved_lat, moved_lon = 51.5160, -0.0885  # ~200m north
+
+        session.last_trigger_location = TriggerLocation(
+            lat=start_lat, lon=start_lon, short_label="Start", timestamp=now - 120.0
+        )
+        session.last_trigger_time = now - 120.0
+        session.last_audio_ended_at = now - 120.0
+        session.current_location = CurrentLocation(
+            lat=moved_lat,
+            lon=moved_lon,
+            short_label="Moved",
+            full_address="Moved",
+            timestamp=now,
+        )
+
+        # User pauses mid-clip at start_lat, start_lon
+        session.update_audio_state(
+            lat=start_lat,
+            lon=start_lon,
+            is_playing_audio=False,
+            is_paused_audio=True,
+            now=now - 60.0,
+        )
+        # Walked 200m (>150m), but only paused for 60s (<180s) -> hold stays active
+        status_recent = session.compute_trigger_status(self.config)
+        self.assertFalse(status_recent.should_trigger)
+        self.assertTrue(status_recent.is_paused_audio)
+
+        # Paused for 200s (>180s), but still standing near pause spot (<150m) -> hold stays active
+        session.paused_at = now - 200.0
+        session.paused_location = (moved_lat, moved_lon)
+        status_nearby = session.compute_trigger_status(self.config)
+        self.assertFalse(status_nearby.should_trigger)
+        self.assertTrue(status_nearby.is_paused_audio)
+
+        # Paused for 200s (>180s) AND walked ~200m (>150m) from pause spot -> hold expires!
+        session.paused_location = (start_lat, start_lon)
+        status_expired = session.compute_trigger_status(self.config)
+        self.assertFalse(status_expired.is_paused_audio)
+        self.assertTrue(status_expired.should_trigger)
+
     def test_session_manager_eviction(self) -> None:
         mgr = SessionManager(max_sessions=2)
         s1 = mgr.get("c1")
@@ -191,7 +300,7 @@ class TestAudioPruningAndAuth(unittest.TestCase):
             )
             self.assertEqual(r_bad_coords.status_code, 422)
 
-            # Duplicate /api/narrate while session.is_generating is True -> 409 Conflict
+            # Duplicate /api/narrate or /api/chat while is_generating is True -> 409 Conflict
             from hear.app import session_manager
 
             sess = session_manager.get("testclient")
@@ -203,8 +312,54 @@ class TestAudioPruningAndAuth(unittest.TestCase):
                     headers=headers,
                 )
                 self.assertEqual(r_conflict.status_code, 409)
+
+                r_chat_conflict = client.post(
+                    "/api/chat",
+                    json={"message": "Tell me more", "lat": 51.5142, "lon": -0.0885},
+                    headers=headers,
+                )
+                self.assertEqual(r_chat_conflict.status_code, 409)
             finally:
                 sess.is_generating = False
+
+    def test_empty_gemini_response_raises_502(self) -> None:
+        fake_resp = httpx.Response(
+            200,
+            json={"candidates": [{"finishReason": "SAFETY", "content": {"parts": []}}]},
+        )
+        with (
+            patch("hear.gemini.get_api_key", return_value="fake-key"),
+            patch("hear.gemini._post_gemini_with_retry", new=AsyncMock(return_value=fake_resp)),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(
+                    call_gemini_text(
+                        contents=[GeminiContent(role="user", parts=[GeminiPart(text="Hello")])],
+                        system_prompt="System",
+                        model="gemini-3.8-flash",
+                    )
+                )
+            self.assertEqual(ctx.exception.status_code, 502)
+            self.assertIn("SAFETY", str(ctx.exception.detail))
+
+    def test_config_manager_atomic_save_and_corrupt_yaml_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "config.yaml"
+            mgr = ConfigManager(cfg_path)
+            initial = AppConfig(system_prompt="Initial prompt")
+            mgr.save(initial)
+            self.assertEqual(mgr.get().system_prompt, "Initial prompt")
+
+            # Write invalid YAML to disk and bump mtime -> falls back to last valid config
+            cfg_path.write_text(":::invalid_yaml: [unclosed", encoding="utf-8")
+            import os
+
+            os.utime(cfg_path, (time.time() + 10.0, time.time() + 10.0))
+            self.assertEqual(mgr.get().system_prompt, "Initial prompt")
+
+    def test_gemini_config_model_id_validation(self) -> None:
+        with self.assertRaises(ValidationError):
+            GeminiConfig(model="../bad/model")
 
 
 if __name__ == "__main__":

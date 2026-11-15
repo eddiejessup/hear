@@ -17,23 +17,24 @@ class PingRequest(HearModel):
     lat: float = Field(ge=-90.0, le=90.0)
     lon: float = Field(ge=-180.0, le=180.0)
     accuracy: float | None = Field(default=None, ge=0.0)
-    heading: float | None = None
-    speed: float | None = None
+    heading: float | None = Field(default=None, ge=0.0, le=360.0)
+    speed: float | None = Field(default=None, ge=0.0)
     is_playing_audio: bool = False
+    is_paused_audio: bool = False
     audio_just_ended: bool = False
 
 
 class NarrateRequest(HearModel):
     lat: float | None = Field(default=None, ge=-90.0, le=90.0)
     lon: float | None = Field(default=None, ge=-180.0, le=180.0)
-    heading: float | None = None
-    lens_id: str | None = None
-    custom_focus: str | None = None
-    reason: str | None = "manual"
+    heading: float | None = Field(default=None, ge=0.0, le=360.0)
+    lens_id: str | None = Field(default=None, max_length=128)
+    custom_focus: str | None = Field(default=None, max_length=1000)
+    reason: str | None = Field(default="manual", max_length=128)
 
 
 class ChatRequest(HearModel):
-    message: str
+    message: str = Field(max_length=4000)
     lat: float | None = Field(default=None, ge=-90.0, le=90.0)
     lon: float | None = Field(default=None, ge=-180.0, le=180.0)
 

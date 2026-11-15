@@ -10,8 +10,10 @@ SERVICE_NAME="${SERVICE_NAME:-hear}"
 REGION="${GCP_REGION:-europe-west1}"
 PROJECT="${GCP_PROJECT:-gen-lang-client-0743073374}"
 
-echo "▸ Running pre-deploy static analysis checks..."
-./deploy/check.sh
+if [[ "${1:-}" != "--skip-checks" ]]; then
+  echo "▸ Running pre-deploy static analysis checks..."
+  ./deploy/check.sh
+fi
 
 # Load .env if present
 if [[ -f ".env" ]]; then

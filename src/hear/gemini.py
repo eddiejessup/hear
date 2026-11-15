@@ -170,6 +170,12 @@ async def call_gemini_text(
     if not text_chunks:
         text_chunks = [str(p.get("text", "")) for p in parts if "text" in p]
     full_text = "\n".join(t for t in text_chunks if t).strip()
+    if not full_text:
+        finish_reason = candidate.get("finishReason") or "UNKNOWN"
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini returned empty text ({model}, finishReason={finish_reason}).",
+        )
 
     grounding = candidate.get("groundingMetadata") or {}
     raw_queries = grounding.get("webSearchQueries") or []
@@ -188,6 +194,11 @@ async def call_gemini_text(
         search_queries=search_queries,
         sources=sources[:6],
     )
+
+
+def _write_and_prune_wav(wav_path: Any, wav_bytes: bytes) -> None:
+    wav_path.write_bytes(wav_bytes)
+    prune_old_audio_files()
 
 
 async def call_gemini_tts(
@@ -249,8 +260,7 @@ async def call_gemini_tts(
             wav_bytes = pcm_to_wav_bytes(raw_bytes, sample_rate=rate)
             audio_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
             wav_path = AUDIO_DIR / f"{audio_id}.wav"
-            wav_path.write_bytes(wav_bytes)
-            prune_old_audio_files()
+            await asyncio.to_thread(_write_and_prune_wav, wav_path, wav_bytes)
             return f"/api/audio/{audio_id}.wav"
 
     return None

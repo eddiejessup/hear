@@ -31,6 +31,9 @@ $TY check
 if [[ -x ".venv/bin/python" ]] && .venv/bin/python -V >/dev/null 2>&1; then
   echo "▸ Running unit tests..."
   .venv/bin/python -m unittest discover -s tests -v
+elif command -v uv >/dev/null 2>&1 && uv run python -V >/dev/null 2>&1; then
+  echo "▸ Running unit tests..."
+  uv run python -m unittest discover -s tests -v
 fi
 
 echo "✓ All static analysis checks passed."

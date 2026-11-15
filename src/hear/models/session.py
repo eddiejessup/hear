@@ -36,6 +36,7 @@ class TriggerStatus(HearModel):
     max_silence_s: float
     is_generating: bool
     is_playing_audio: bool
+    is_paused_audio: bool = False
 
 
 class MessageLocation(HearModel):

@@ -75,12 +75,12 @@ async def auth_middleware(
     return await call_next(request)
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
+@app.get("/", response_model=None)
+async def index() -> Response:
     index_file = STATIC_DIR / "index.html"
     if not index_file.exists():
         return HTMLResponse("<h1>static/index.html not found</h1>", status_code=404)
-    return HTMLResponse(index_file.read_text(encoding="utf-8"))
+    return FileResponse(index_file, media_type="text/html")
 
 
 @app.get("/api/state")
@@ -111,9 +111,13 @@ async def ping_location(req: PingRequest, request: Request) -> PingResponse:
     session = _get_session(request)
     cfg = config_manager.get()
 
-    if req.audio_just_ended or (session.is_playing_audio and not req.is_playing_audio):
-        session.last_audio_ended_at = time.time()
-    session.is_playing_audio = req.is_playing_audio
+    session.update_audio_state(
+        lat=req.lat,
+        lon=req.lon,
+        is_playing_audio=req.is_playing_audio,
+        is_paused_audio=req.is_paused_audio,
+        audio_just_ended=req.audio_just_ended,
+    )
 
     prefetch_overpass = session.should_prefetch_overpass(cfg, req.lat, req.lon)
     geo = await reverse_geocode_and_context(req.lat, req.lon, include_overpass=prefetch_overpass)
@@ -146,6 +150,11 @@ async def trigger_narration(req: NarrateRequest, request: Request) -> NarrateRes
         )
 
     async with session.lock:
+        if session.is_generating:
+            raise HTTPException(
+                status_code=409,
+                detail="Narration or response generation is already in progress.",
+            )
         cfg = config_manager.get()
         lat, lon, heading = session.resolve_coords(req.lat, req.lon, req.heading)
 
@@ -181,7 +190,18 @@ async def steer_chat(req: ChatRequest, request: Request) -> ChatResponse:
         raise HTTPException(status_code=400, detail="Empty message.")
 
     session = _get_session(request)
+    if session.is_generating or session.lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail="Narration or response generation is already in progress.",
+        )
+
     async with session.lock:
+        if session.is_generating:
+            raise HTTPException(
+                status_code=409,
+                detail="Narration or response generation is already in progress.",
+            )
         cfg = config_manager.get()
         lat, lon, _ = session.resolve_coords(req.lat, req.lon)
 

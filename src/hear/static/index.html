@@ -686,12 +686,25 @@
     let watchId = null;
     let isGenerating = false;
     let isPlayingAudio = false;
+    let isPausedAudio = false;
     let playbackSpeeds = [1.0, 1.15, 1.25, 1.4];
     let speedIdx = 0;
     let wakeLockSentinel = null;
     let keepAliveAudio = null;
     let authPromptInFlight = false;
     let pingInFlight = false;
+    let lastPingSnapshot = null;
+
+    function approxDistanceMeters(lat1, lon1, lat2, lon2) {
+      const r = 6371000;
+      const toRad = (d) => (d * Math.PI) / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+      return 2 * r * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
 
     const mainAudio = document.getElementById("mainAudio");
     const audioBar = document.getElementById("audioBar");
@@ -824,7 +837,22 @@
     }
 
     async function periodicPing() {
-      if (!currentCoords) return;
+      if (!currentCoords || isGenerating) return;
+      const autoEnabled = currentConfig?.triggers?.auto_trigger_enabled ?? false;
+      if (
+        !autoEnabled &&
+        lastPingSnapshot &&
+        lastPingSnapshot.isPlayingAudio === isPlayingAudio &&
+        lastPingSnapshot.isPausedAudio === isPausedAudio &&
+        approxDistanceMeters(
+          currentCoords.lat,
+          currentCoords.lon,
+          lastPingSnapshot.lat,
+          lastPingSnapshot.lon
+        ) < 3.0
+      ) {
+        return;
+      }
       await sendPing(false);
     }
 
@@ -843,11 +871,18 @@
             heading: currentCoords.heading ?? null,
             speed: currentCoords.speed ?? null,
             is_playing_audio: isPlayingAudio,
+            is_paused_audio: isPausedAudio,
             audio_just_ended: audioJustEnded,
           }),
         });
         if (!res.ok) return;
         const data = await res.json();
+        lastPingSnapshot = {
+          lat: currentCoords.lat,
+          lon: currentCoords.lon,
+          isPlayingAudio,
+          isPausedAudio,
+        };
         updateLocationHeader(data.location, data.trigger_status);
 
         if (data.trigger_status?.should_trigger && !isGenerating && !isPlayingAudio) {
@@ -877,6 +912,8 @@
           cdBadge.textContent = "Researching…";
         } else if (isPlayingAudio) {
           cdBadge.textContent = "Playing audio";
+        } else if (status.is_paused_audio) {
+          cdBadge.textContent = "Paused (holding)";
         } else if (status.cooldown_remaining_s > 0) {
           cdBadge.textContent = `Cooldown: ${Math.ceil(status.cooldown_remaining_s)}s`;
         } else {
@@ -1085,14 +1122,21 @@
     function setupAudioEvents() {
       mainAudio.addEventListener("play", () => {
         isPlayingAudio = true;
+        isPausedAudio = false;
       });
       mainAudio.addEventListener("pause", () => {
         if (mainAudio.ended) return;
         isPlayingAudio = false;
+        isPausedAudio = mainAudio.currentTime > 0;
       });
       mainAudio.addEventListener("ended", () => {
         isPlayingAudio = false;
+        isPausedAudio = false;
         sendPing(true);
+      });
+      mainAudio.addEventListener("error", () => {
+        isPlayingAudio = false;
+        isPausedAudio = false;
       });
     }
 
@@ -1327,16 +1371,43 @@
     // -----------------------------------------------------------------------
     // Live Config Drawer
     // -----------------------------------------------------------------------
+    function setSelectValuePreservingCustom(selectEl, value, fallback) {
+      const resolved = value || fallback;
+      if (resolved && !Array.from(selectEl.options).some((opt) => opt.value === resolved)) {
+        const customOpt = document.createElement("option");
+        customOpt.value = resolved;
+        customOpt.textContent = `${resolved} (Custom)`;
+        selectEl.appendChild(customOpt);
+      }
+      selectEl.value = resolved;
+    }
+
+    function parseNonNegativeFloat(raw, fallback) {
+      const n = parseFloat(raw);
+      return Number.isFinite(n) && n >= 0 ? n : fallback;
+    }
+
     async function toggleAutoTrigger() {
+      try {
+        const cfgRes = await apiFetch("/api/config");
+        if (cfgRes.ok) {
+          currentConfig = await cfgRes.json();
+        }
+      } catch (e) {}
       if (!currentConfig) return;
       currentConfig.triggers = currentConfig.triggers || {};
       currentConfig.triggers.auto_trigger_enabled = !currentConfig.triggers.auto_trigger_enabled;
       updateAutoTriggerButton(currentConfig.triggers.auto_trigger_enabled);
-      await apiFetch("/api/config", {
+      const res = await apiFetch("/api/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(currentConfig),
       });
+      if (res.ok) {
+        const data = await res.json();
+        currentConfig = data.config;
+        renderLensesStrip(currentConfig.lenses || []);
+      }
       sendPing(false);
     }
 
@@ -1346,13 +1417,19 @@
       btn.className = enabled ? "icon-btn active" : "icon-btn";
     }
 
-    function openConfigDrawer() {
+    async function openConfigDrawer() {
+      try {
+        const cfgRes = await apiFetch("/api/config");
+        if (cfgRes.ok) {
+          currentConfig = await cfgRes.json();
+        }
+      } catch (e) {}
       if (!currentConfig) return;
       const g = currentConfig.gemini || {};
       const t = currentConfig.triggers || {};
 
-      document.getElementById("cfgModel").value = g.model || "gemini-3.8-flash";
-      document.getElementById("cfgVoice").value = g.tts_voice || "Charon";
+      setSelectValuePreservingCustom(document.getElementById("cfgModel"), g.model, "gemini-3.8-flash");
+      setSelectValuePreservingCustom(document.getElementById("cfgVoice"), g.tts_voice, "Charon");
       document.getElementById("cfgTtsEnabled").value = String(g.tts_enabled ?? true);
       document.getElementById("cfgTtsStyle").value = g.tts_style_prompt || "";
       document.getElementById("cfgMinDist").value = t.min_distance_meters ?? 120;
@@ -1407,15 +1484,15 @@
     async function saveConfigToServer() {
       const updated = JSON.parse(JSON.stringify(currentConfig || {}));
       updated.gemini = updated.gemini || {};
-      updated.gemini.model = document.getElementById("cfgModel").value;
-      updated.gemini.tts_voice = document.getElementById("cfgVoice").value;
+      updated.gemini.model = document.getElementById("cfgModel").value || updated.gemini.model || "gemini-3.8-flash";
+      updated.gemini.tts_voice = document.getElementById("cfgVoice").value || updated.gemini.tts_voice || "Charon";
       updated.gemini.tts_enabled = document.getElementById("cfgTtsEnabled").value === "true";
       updated.gemini.tts_style_prompt = document.getElementById("cfgTtsStyle").value;
 
       updated.triggers = updated.triggers || {};
-      updated.triggers.min_distance_meters = parseFloat(document.getElementById("cfgMinDist").value) || 120;
-      updated.triggers.min_cooldown_seconds = parseFloat(document.getElementById("cfgMinCooldown").value) || 90;
-      updated.triggers.max_silence_seconds = parseFloat(document.getElementById("cfgMaxSilence").value) || 300;
+      updated.triggers.min_distance_meters = parseNonNegativeFloat(document.getElementById("cfgMinDist").value, 120);
+      updated.triggers.min_cooldown_seconds = parseNonNegativeFloat(document.getElementById("cfgMinCooldown").value, 90);
+      updated.triggers.max_silence_seconds = parseNonNegativeFloat(document.getElementById("cfgMaxSilence").value, 300);
 
       updated.system_prompt = document.getElementById("cfgSystemPrompt").value;
 

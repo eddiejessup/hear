@@ -24,6 +24,9 @@ from hear.models.session import (
 from hear.paths import SESSIONS_DIR
 
 MAX_ACTIVE_SESSIONS = 64
+PAUSE_HOLD_MAX_SECONDS = 180.0
+PAUSE_HOLD_MAX_DISTANCE_METERS = 150.0
+INITIAL_LOCATION_CHAT_GRACE_SECONDS = 15.0
 _SAFE_CLIENT_ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
 
@@ -50,6 +53,9 @@ class WalkSession:
         self.last_audio_ended_at: float | None = None
         self.is_generating: bool = False
         self.is_playing_audio: bool = False
+        self.is_paused_audio: bool = False
+        self.paused_at: float | None = None
+        self.paused_location: tuple[float, float] | None = None
         self.reset()
 
     def reset(self) -> None:
@@ -67,6 +73,54 @@ class WalkSession:
         self.last_audio_ended_at = None
         self.is_generating = False
         self.is_playing_audio = False
+        self.is_paused_audio = False
+        self.paused_at = None
+        self.paused_location = None
+
+    def update_audio_state(
+        self,
+        *,
+        lat: float,
+        lon: float,
+        is_playing_audio: bool,
+        is_paused_audio: bool = False,
+        audio_just_ended: bool = False,
+        now: float | None = None,
+    ) -> None:
+        ts = now if now is not None else time.time()
+        if audio_just_ended or (
+            self.is_playing_audio and not is_playing_audio and not is_paused_audio
+        ):
+            self.last_audio_ended_at = ts
+
+        if is_paused_audio and not is_playing_audio:
+            if not self.is_paused_audio or self.paused_at is None:
+                self.paused_at = ts
+                self.paused_location = (lat, lon)
+        else:
+            self.paused_at = None
+            self.paused_location = None
+
+        self.is_playing_audio = is_playing_audio
+        self.is_paused_audio = is_paused_audio and not is_playing_audio
+
+    def is_pause_hold_active(self, now: float) -> bool:
+        """Return True if audio is paused mid-clip and hasn't expired via time + distance."""
+        if not self.is_paused_audio:
+            return False
+        if self.paused_at is None or self.paused_location is None or self.current_location is None:
+            return True
+        paused_elapsed_s = now - self.paused_at
+        dist_from_pause_m = haversine_meters(
+            self.current_location.lat,
+            self.current_location.lon,
+            self.paused_location[0],
+            self.paused_location[1],
+        )
+        return not (
+            paused_elapsed_s >= PAUSE_HOLD_MAX_SECONDS
+            and dist_from_pause_m >= PAUSE_HOLD_MAX_DISTANCE_METERS
+        )
 
     def resolve_coords(
         self,
@@ -111,6 +165,9 @@ class WalkSession:
         model_turn = GeminiContent(role="model", parts=[GeminiPart(text=llm_result.text)])
         self.gemini_contents = [*trial_contents, model_turn]
         self.last_trigger_time = now
+        self.is_paused_audio = False
+        self.paused_at = None
+        self.paused_location = None
         if audio_url is None:
             self.last_audio_ended_at = now
 
@@ -171,10 +228,16 @@ class WalkSession:
             default=None,
         )
         silence_elapsed_s = (now - ref_time) if ref_time is not None else None
+        effective_cooldown_s = (
+            min(min_cooldown_s, INITIAL_LOCATION_CHAT_GRACE_SECONDS)
+            if self.last_trigger_location is None
+            else min_cooldown_s
+        )
         cooldown_remaining_s = 0.0
         if silence_elapsed_s is not None:
-            cooldown_remaining_s = max(0.0, min_cooldown_s - silence_elapsed_s)
+            cooldown_remaining_s = max(0.0, effective_cooldown_s - silence_elapsed_s)
 
+        pause_hold_active = self.is_pause_hold_active(now)
         should_trigger = False
         trigger_reason: str | None = None
 
@@ -182,24 +245,23 @@ class WalkSession:
             auto_enabled
             and not self.is_generating
             and not self.is_playing_audio
+            and not pause_hold_active
             and self.current_location
+            and cooldown_remaining_s <= 0
         ):
             if self.last_trigger_location is None:
                 should_trigger = True
                 trigger_reason = "initial_location"
-            elif cooldown_remaining_s <= 0:
-                if dist_moved_m is not None and dist_moved_m >= min_dist_m:
-                    should_trigger = True
-                    trigger_reason = f"distance ({int(dist_moved_m)}m >= {int(min_dist_m)}m)"
-                elif (
-                    silence_elapsed_s is not None
-                    and silence_elapsed_s >= max_silence_s
-                    and (dist_moved_m is None or dist_moved_m >= min_drift_m)
-                ):
-                    should_trigger = True
-                    trigger_reason = (
-                        f"max_silence ({int(silence_elapsed_s)}s >= {int(max_silence_s)}s)"
-                    )
+            elif dist_moved_m is not None and dist_moved_m >= min_dist_m:
+                should_trigger = True
+                trigger_reason = f"distance ({int(dist_moved_m)}m >= {int(min_dist_m)}m)"
+            elif (
+                silence_elapsed_s is not None
+                and silence_elapsed_s >= max_silence_s
+                and (dist_moved_m is None or dist_moved_m >= min_drift_m)
+            ):
+                should_trigger = True
+                trigger_reason = f"max_silence ({int(silence_elapsed_s)}s >= {int(max_silence_s)}s)"
 
         return TriggerStatus(
             auto_trigger_enabled=auto_enabled,
@@ -215,12 +277,18 @@ class WalkSession:
             max_silence_s=max_silence_s,
             is_generating=self.is_generating,
             is_playing_audio=self.is_playing_audio,
+            is_paused_audio=pause_hold_active,
         )
 
     def should_prefetch_overpass(self, config: AppConfig, lat: float, lon: float) -> bool:
         """Return True if the user is approaching a narration trigger (>75% of min_distance)."""
         trig = config.triggers
-        if not trig.auto_trigger_enabled or self.is_generating or self.is_playing_audio:
+        if (
+            not trig.auto_trigger_enabled
+            or self.is_generating
+            or self.is_playing_audio
+            or self.is_pause_hold_active(time.time())
+        ):
             return False
         if self.last_trigger_location is None:
             return True
@@ -310,7 +378,7 @@ class WalkSession:
             search_queries=llm_result.search_queries,
         )
         self.ui_messages.append(msg_record)
-        self.persist_transcript()
+        await asyncio.to_thread(self.persist_transcript)
         return msg_record
 
     async def execute_chat_turn(
@@ -352,7 +420,7 @@ class WalkSession:
         )
         self.ui_messages.append(user_msg_ui)
         self.ui_messages.append(assistant_msg_ui)
-        self.persist_transcript()
+        await asyncio.to_thread(self.persist_transcript)
         return user_msg_ui, assistant_msg_ui
 
     def persist_transcript(self) -> None:
