@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from hear.config import config_manager
 from hear.gemini import call_gemini_text, call_gemini_tts, get_api_key
 from hear.geo import compass_bearing_label, reverse_geocode_and_context
-from hear.models import ChatRequest, NarrateRequest, PingRequest
+from hear.models import AppConfig, ChatRequest, NarrateRequest, PingRequest
 from hear.paths import AUDIO_DIR, STATIC_DIR, ensure_dirs
 from hear.session import session
 
@@ -117,8 +117,8 @@ async def trigger_narration(req: NarrateRequest) -> dict[str, Any]:
                 else ""
             )
 
-            lens_name = lens.get("name", "Historical Lens")
-            lens_prompt = lens.get("prompt", "")
+            lens_name = lens.name
+            lens_prompt = lens.prompt
 
             location_prompt = (
                 f"[LOCATION TRIGGER — {geo['short_label']}]\n"
@@ -131,11 +131,11 @@ async def trigger_narration(req: NarrateRequest) -> dict[str, Any]:
                 "through the selected lens."
             )
 
-            gemini_cfg = cfg.get("gemini") or {}
-            model_name = str(gemini_cfg.get("model", "gemini-3.8-flash"))
-            temperature = float(gemini_cfg.get("temperature", 0.75))
-            enable_search = bool(gemini_cfg.get("enable_google_search", True))
-            system_prompt = str(cfg.get("system_prompt", ""))
+            gemini_cfg = cfg.gemini
+            model_name = gemini_cfg.model
+            temperature = gemini_cfg.temperature
+            enable_search = gemini_cfg.enable_google_search
+            system_prompt = cfg.system_prompt
 
             trial_contents = [
                 *session.gemini_contents,
@@ -153,12 +153,12 @@ async def trigger_narration(req: NarrateRequest) -> dict[str, Any]:
             reply_text = llm_result["text"]
 
             audio_url: str | None = None
-            if gemini_cfg.get("tts_enabled", True):
+            if gemini_cfg.tts_enabled:
                 audio_url = await call_gemini_tts(
                     text=reply_text,
-                    tts_model=str(gemini_cfg.get("tts_model", "gemini-3.8-flash-tts")),
-                    voice_name=str(gemini_cfg.get("tts_voice", "Charon")),
-                    style_prompt=str(gemini_cfg.get("tts_style_prompt", "")),
+                    tts_model=gemini_cfg.tts_model,
+                    voice_name=gemini_cfg.tts_voice,
+                    style_prompt=gemini_cfg.tts_style_prompt,
                 )
 
             now = time.time()
@@ -186,7 +186,7 @@ async def trigger_narration(req: NarrateRequest) -> dict[str, Any]:
                     "short_label": geo["short_label"],
                     "nearby_features": geo["nearby_features"],
                 },
-                "lens": {"id": lens.get("id"), "name": lens_name},
+                "lens": {"id": lens.id, "name": lens_name},
                 "reason": req.reason,
                 "model": model_name,
                 "text": reply_text,
@@ -237,11 +237,11 @@ async def steer_chat(req: ChatRequest) -> dict[str, Any]:
             }
             session.ui_messages.append(user_msg_ui)
 
-            gemini_cfg = cfg.get("gemini") or {}
-            model_name = str(gemini_cfg.get("model", "gemini-3.8-flash"))
-            temperature = float(gemini_cfg.get("temperature", 0.75))
-            enable_search = bool(gemini_cfg.get("enable_google_search", True))
-            system_prompt = str(cfg.get("system_prompt", ""))
+            gemini_cfg = cfg.gemini
+            model_name = gemini_cfg.model
+            temperature = gemini_cfg.temperature
+            enable_search = gemini_cfg.enable_google_search
+            system_prompt = cfg.system_prompt
 
             user_prompt_text = f"{loc_prefix}User message: {req.message.strip()}"
             trial_contents = [
@@ -260,12 +260,12 @@ async def steer_chat(req: ChatRequest) -> dict[str, Any]:
             reply_text = llm_result["text"]
 
             audio_url: str | None = None
-            if gemini_cfg.get("tts_enabled", True):
+            if gemini_cfg.tts_enabled:
                 audio_url = await call_gemini_tts(
                     text=reply_text,
-                    tts_model=str(gemini_cfg.get("tts_model", "gemini-3.8-flash-tts")),
-                    voice_name=str(gemini_cfg.get("tts_voice", "Charon")),
-                    style_prompt=str(gemini_cfg.get("tts_style_prompt", "")),
+                    tts_model=gemini_cfg.tts_model,
+                    voice_name=gemini_cfg.tts_voice,
+                    style_prompt=gemini_cfg.tts_style_prompt,
                 )
 
             now = time.time()
@@ -313,12 +313,12 @@ async def get_audio(filename: str) -> FileResponse:
 
 
 @app.get("/api/config")
-async def get_config() -> dict[str, Any]:
+async def get_config() -> AppConfig:
     return config_manager.get()
 
 
 @app.put("/api/config")
-async def update_config(new_config: dict[str, Any]) -> dict[str, Any]:
+async def update_config(new_config: AppConfig) -> dict[str, Any]:
     saved = config_manager.save(new_config)
     return {
         "config": saved,

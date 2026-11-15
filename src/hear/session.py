@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from hear.geo import haversine_meters
-from hear.models import LensConfig
+from hear.models import AppConfig, LensConfig
 from hear.paths import SESSIONS_DIR
 
 
@@ -39,52 +39,45 @@ class WalkSession:
         self.is_generating = False
         self.is_playing_audio = False
 
-    def sample_lens(
-        self, config: dict[str, Any], requested_lens_id: str | None = None
-    ) -> LensConfig:
-        raw_lenses = config.get("lenses")
-        all_lenses: list[LensConfig] = raw_lenses if isinstance(raw_lenses, list) else []
-        enabled_lenses: list[LensConfig] = [
-            lens for lens in all_lenses if lens.get("enabled", True)
-        ]
+    def sample_lens(self, config: AppConfig, requested_lens_id: str | None = None) -> LensConfig:
+        all_lenses = config.lenses
+        enabled_lenses = [lens for lens in all_lenses if lens.enabled]
         if not enabled_lenses:
             enabled_lenses = all_lenses or [
-                {
-                    "id": "general_history",
-                    "name": "Deep Local History",
-                    "prompt": (
+                LensConfig(
+                    id="general_history",
+                    name="Deep Local History",
+                    prompt=(
                         "Explore the structural, economic, and political history "
                         "of this immediate location."
                     ),
-                }
+                )
             ]
 
         if requested_lens_id:
             for lens in all_lenses:
-                if lens.get("id") == requested_lens_id:
-                    lens_id = lens.get("id", "")
-                    if lens_id and lens_id not in self.used_lens_ids:
-                        self.used_lens_ids.append(lens_id)
+                if lens.id == requested_lens_id:
+                    if lens.id and lens.id not in self.used_lens_ids:
+                        self.used_lens_ids.append(lens.id)
                     return lens
 
-        available = [lens for lens in enabled_lenses if lens.get("id") not in self.used_lens_ids]
+        available = [lens for lens in enabled_lenses if lens.id not in self.used_lens_ids]
         if not available:
             self.used_lens_ids.clear()
             available = enabled_lenses
 
         chosen = random.choice(available)
-        chosen_id = chosen.get("id", "")
-        if chosen_id:
-            self.used_lens_ids.append(chosen_id)
+        if chosen.id:
+            self.used_lens_ids.append(chosen.id)
         return chosen
 
-    def compute_trigger_status(self, config: dict[str, Any]) -> dict[str, Any]:
-        trig = config.get("triggers") or {}
-        auto_enabled = bool(trig.get("auto_trigger_enabled", True))
-        min_dist_m = float(trig.get("min_distance_meters", 120))
-        min_cooldown_s = float(trig.get("min_cooldown_seconds", 90))
-        max_silence_s = float(trig.get("max_silence_seconds", 300))
-        min_drift_m = float(trig.get("min_drift_for_silence_trigger_meters", 15))
+    def compute_trigger_status(self, config: AppConfig) -> dict[str, Any]:
+        trig = config.triggers
+        auto_enabled = trig.auto_trigger_enabled
+        min_dist_m = trig.min_distance_meters
+        min_cooldown_s = trig.min_cooldown_seconds
+        max_silence_s = trig.max_silence_seconds
+        min_drift_m = trig.min_drift_for_silence_trigger_meters
 
         now = time.time()
         dist_moved_m: float | None = None
