@@ -477,6 +477,7 @@
       <div class="brand">
         <span id="gpsDot" class="gps-dot"></span>
         <span>Hear</span>
+        <span id="versionBadge" class="badge" style="font-size: 0.7rem; color: var(--muted); cursor: pointer;" onclick="openSimDrawer()" title="Build &amp; Runtime Info">--</span>
       </div>
       <div class="top-actions">
         <button id="autoToggleBtn" class="icon-btn active" onclick="toggleAutoTrigger()">
@@ -590,6 +591,13 @@
       <div style="display: flex; justify-content: space-between; align-items: center;">
         <span style="font-size: 0.85rem; color: var(--muted);">Clear current walk memory &amp; start fresh</span>
         <button class="icon-btn" style="border-color: var(--red); color: #fca5a5;" onclick="resetSession()">Reset Walk Session</button>
+      </div>
+      <hr style="border: none; border-top: 1px solid var(--border); width: 100%;" />
+      <div class="field-group">
+        <label>Debug &amp; Build Info</label>
+        <div id="debugInfoBox" style="background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 0.78rem; color: var(--muted); line-height: 1.65; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">
+          Loading build info…
+        </div>
       </div>
     </div>
   </div>
@@ -742,6 +750,7 @@
         currentConfig = data.config;
         renderLensesStrip(currentConfig.lenses || []);
         updateAutoTriggerButton(currentConfig.triggers?.auto_trigger_enabled ?? true);
+        renderDebugInfo(data.debug_info, data.session_id);
 
         if (!data.has_api_key) {
           addSystemBanner("⚠️ GEMINI_API_KEY is not set on the server. Set GEMINI_API_KEY in your environment or .env file.");
@@ -1202,7 +1211,49 @@
     // -----------------------------------------------------------------------
     // Simulator & Session Controls
     // -----------------------------------------------------------------------
+    function formatUptime(sec) {
+      if (typeof sec !== "number" || sec < 0) return "--";
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      if (h > 0) return `${h}h ${m}m ${s}s`;
+      if (m > 0) return `${m}m ${s}s`;
+      return `${s}s`;
+    }
+
+    function renderDebugInfo(info, sessionId) {
+      if (!info) return;
+      const badge = document.getElementById("versionBadge");
+      if (badge) {
+        const revShort = info.cloud_run_revision && info.cloud_run_revision !== "local"
+          ? ` • ${info.cloud_run_revision.replace(/^hear-/, "")}`
+          : " • local";
+        badge.textContent = `${info.git_commit}${revShort}`;
+      }
+      const box = document.getElementById("debugInfoBox");
+      if (box) {
+        box.innerHTML = [
+          `<div><strong>Git Commit:</strong> ${escapeHtml(info.git_commit)} (${escapeHtml(info.git_commit_time)})</div>`,
+          `<div><strong>Built At:</strong> ${escapeHtml(info.build_time)}</div>`,
+          `<div><strong>Revision:</strong> ${escapeHtml(info.cloud_run_revision)} (${escapeHtml(info.cloud_run_service)})</div>`,
+          `<div><strong>Server Boot:</strong> ${escapeHtml(info.server_started_at)} (up ${formatUptime(info.server_uptime_seconds)})</div>`,
+          `<div><strong>Python:</strong> ${escapeHtml(info.python_version)}</div>`,
+          `<div><strong>Session ID:</strong> ${escapeHtml(sessionId || "--")}</div>`,
+        ].join("");
+      }
+    }
+
+    async function refreshDebugInfoOnly() {
+      try {
+        const res = await apiFetch("/api/state");
+        if (!res.ok) return;
+        const data = await res.json();
+        renderDebugInfo(data.debug_info, data.session_id);
+      } catch (e) {}
+    }
+
     function openSimDrawer() {
+      refreshDebugInfoOnly();
       if (currentCoords) {
         document.getElementById("simLat").value = currentCoords.lat.toFixed(5);
         document.getElementById("simLon").value = currentCoords.lon.toFixed(5);

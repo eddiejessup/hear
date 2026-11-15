@@ -177,6 +177,17 @@ class ChatRequest(HearModel):
     lon: float | None = None
 
 
+class DebugInfo(HearModel):
+    git_commit: str
+    git_commit_time: str
+    build_time: str
+    cloud_run_revision: str
+    cloud_run_service: str
+    python_version: str
+    server_started_at: str
+    server_uptime_seconds: int
+
+
 class StateResponse(HearModel):
     session_id: str
     has_api_key: bool
@@ -186,6 +197,7 @@ class StateResponse(HearModel):
     used_lens_ids: list[str]
     trigger_status: TriggerStatus
     config: AppConfig
+    debug_info: DebugInfo
 
 
 class PingResponse(HearModel):

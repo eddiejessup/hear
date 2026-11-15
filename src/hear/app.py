@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from hear.auth import get_expected_auth_token, is_unauthenticated_allowed, verify_token
 from hear.config import config_manager
+from hear.debug import get_debug_info
 from hear.gemini import call_gemini_text, call_gemini_tts, get_api_key
 from hear.geo import compass_bearing_label, reverse_geocode_and_context
 from hear.models import (
@@ -94,6 +95,7 @@ async def get_state() -> StateResponse:
         used_lens_ids=session.used_lens_ids,
         trigger_status=session.compute_trigger_status(cfg),
         config=cfg,
+        debug_info=get_debug_info(),
     )
 
 
