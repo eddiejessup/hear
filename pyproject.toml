@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hear"
+version = "0.1.0"
+description = "Free-roaming location-aware historical walking companion powered by Gemini"
+readme = "README.md"
+requires-python = ">=3.15"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.34.0",
+    "httpx>=0.28.0",
+    "pyyaml>=6.0.2",
+    "pydantic>=2.10.0",
+]
+
+[project.scripts]
+hear = "hear.app:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.9.0",
+    "ty>=0.0.1a0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hear"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py315"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ty.environment]
+python-version = "3.15"
