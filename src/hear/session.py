@@ -1,11 +1,13 @@
 import asyncio
 import random
+import re
 import time
 from datetime import UTC, datetime
 
+from hear.gemini import call_gemini_text, call_gemini_tts
 from hear.geo import haversine_meters
 from hear.models.config import AppConfig, LensConfig
-from hear.models.gemini import GeminiContent
+from hear.models.gemini import GeminiContent, GeminiPart, GeminiTextResult
 from hear.models.session import (
     CurrentLocation,
     SessionTranscript,
@@ -15,12 +17,24 @@ from hear.models.session import (
 )
 from hear.paths import SESSIONS_DIR
 
+MAX_ACTIVE_SESSIONS = 64
+_SAFE_CLIENT_ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
+
+
+def sanitize_client_id(raw_client_id: str | None) -> str:
+    if not raw_client_id:
+        return "default"
+    cleaned = _SAFE_CLIENT_ID_RE.sub("", raw_client_id.strip())[:48]
+    return cleaned or "default"
+
 
 class WalkSession:
-    def __init__(self) -> None:
+    def __init__(self, client_id: str = "default") -> None:
+        self.client_id: str = sanitize_client_id(client_id)
         self.lock = asyncio.Lock()
         self.session_id: str = ""
         self.started_at: float = 0.0
+        self.last_active_at: float = time.time()
         self.gemini_contents: list[GeminiContent] = []
         self.ui_messages: list[UIMessage] = []
         self.used_lens_ids: list[str] = []
@@ -33,8 +47,11 @@ class WalkSession:
         self.reset()
 
     def reset(self) -> None:
-        self.session_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        suffix = self.client_id[:8]
+        self.session_id = f"{ts}_{suffix}" if suffix != "default" else ts
         self.started_at = time.time()
+        self.last_active_at = self.started_at
         self.gemini_contents = []
         self.ui_messages = []
         self.used_lens_ids = []
@@ -44,6 +61,54 @@ class WalkSession:
         self.last_audio_ended_at = None
         self.is_generating = False
         self.is_playing_audio = False
+
+    def resolve_coords(
+        self,
+        lat: float | None,
+        lon: float | None,
+        heading: float | None = None,
+    ) -> tuple[float | None, float | None, float | None]:
+        cur = self.current_location
+        resolved_lat = lat if lat is not None else (cur.lat if cur else None)
+        resolved_lon = lon if lon is not None else (cur.lon if cur else None)
+        resolved_heading = heading if heading is not None else (cur.heading if cur else None)
+        return resolved_lat, resolved_lon, resolved_heading
+
+    async def run_gemini_turn(
+        self,
+        config: AppConfig,
+        user_prompt_text: str,
+    ) -> tuple[GeminiTextResult, str | None, float]:
+        """Run a Gemini text + optional TTS turn and append it to session history."""
+        gemini_cfg = config.gemini
+        user_turn = GeminiContent(role="user", parts=[GeminiPart(text=user_prompt_text)])
+        trial_contents: list[GeminiContent] = [*self.gemini_contents, user_turn]
+
+        llm_result = await call_gemini_text(
+            contents=trial_contents,
+            system_prompt=config.system_prompt,
+            model=gemini_cfg.model,
+            temperature=gemini_cfg.temperature,
+            enable_google_search=gemini_cfg.enable_google_search,
+        )
+
+        audio_url: str | None = None
+        if gemini_cfg.tts_enabled:
+            audio_url = await call_gemini_tts(
+                text=llm_result.text,
+                tts_model=gemini_cfg.tts_model,
+                voice_name=gemini_cfg.tts_voice,
+                style_prompt=gemini_cfg.tts_style_prompt,
+            )
+
+        now = time.time()
+        model_turn = GeminiContent(role="model", parts=[GeminiPart(text=llm_result.text)])
+        self.gemini_contents = [*trial_contents, model_turn]
+        self.last_trigger_time = now
+        if audio_url is None:
+            self.last_audio_ended_at = now
+
+        return llm_result, audio_url, now
 
     def sample_lens(self, config: AppConfig, requested_lens_id: str | None = None) -> LensConfig:
         all_lenses = config.lenses
@@ -95,8 +160,11 @@ class WalkSession:
                 self.last_trigger_location.lon,
             )
 
-        ref_time = self.last_audio_ended_at or self.last_trigger_time
-        silence_elapsed_s = (now - ref_time) if ref_time else None
+        ref_time = max(
+            (t for t in (self.last_audio_ended_at, self.last_trigger_time) if t is not None),
+            default=None,
+        )
+        silence_elapsed_s = (now - ref_time) if ref_time is not None else None
         cooldown_remaining_s = 0.0
         if silence_elapsed_s is not None:
             cooldown_remaining_s = max(0.0, min_cooldown_s - silence_elapsed_s)
@@ -153,4 +221,27 @@ class WalkSession:
         out_file.write_text(transcript.model_dump_json(indent=2), encoding="utf-8")
 
 
-session = WalkSession()
+class SessionManager:
+    """Manages isolated WalkSession instances per client_id."""
+
+    def __init__(self, max_sessions: int = MAX_ACTIVE_SESSIONS) -> None:
+        self._sessions: dict[str, WalkSession] = {}
+        self._max_sessions = max_sessions
+
+    def get(self, raw_client_id: str | None) -> WalkSession:
+        client_id = sanitize_client_id(raw_client_id)
+        walk_session = self._sessions.get(client_id)
+        if walk_session is None:
+            if len(self._sessions) >= self._max_sessions:
+                oldest_key = min(
+                    self._sessions,
+                    key=lambda k: self._sessions[k].last_active_at,
+                )
+                self._sessions.pop(oldest_key, None)
+            walk_session = WalkSession(client_id=client_id)
+            self._sessions[client_id] = walk_session
+        walk_session.last_active_at = time.time()
+        return walk_session
+
+
+session_manager = SessionManager()

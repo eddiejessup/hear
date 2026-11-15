@@ -1,6 +1,7 @@
+import asyncio
 import base64
 import io
-import os
+import logging
 import re
 import time
 import uuid
@@ -10,22 +11,33 @@ from typing import Any
 import httpx
 from fastapi import HTTPException
 
+from hear.auth import read_env_var
 from hear.models.gemini import GeminiContent, GeminiTextResult, GroundingSource
-from hear.paths import AUDIO_DIR, PROJECT_ROOT
+from hear.paths import AUDIO_DIR
+
+logger = logging.getLogger(__name__)
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+_http_client: httpx.AsyncClient | None = None
+
+
+def get_gemini_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=90.0)
+    return _http_client
+
+
+async def close_gemini_http_client() -> None:
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        await _http_client.aclose()
+    _http_client = None
 
 
 def get_api_key() -> str:
-    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
-    if not key:
-        env_file = PROJECT_ROOT / ".env"
-        if env_file.exists():
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                stripped = line.strip()
-                if stripped.startswith("GEMINI_API_KEY=") or stripped.startswith("GOOGLE_API_KEY="):
-                    key = stripped.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
+    key = read_env_var("GEMINI_API_KEY") or read_env_var("GOOGLE_API_KEY")
     if not key:
         raise HTTPException(
             status_code=400,
@@ -35,6 +47,45 @@ def get_api_key() -> str:
             ),
         )
     return key
+
+
+async def _post_gemini_with_retry(
+    url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    timeout: float,
+    max_attempts: int = 3,
+) -> httpx.Response:
+    client = get_gemini_http_client()
+    headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
+    last_exc: httpx.TransportError | None = None
+
+    for attempt in range(max_attempts):
+        try:
+            resp = await client.post(url, headers=headers, json=payload, timeout=timeout)
+            if resp.status_code not in _RETRYABLE_STATUS_CODES or attempt == max_attempts - 1:
+                return resp
+            logger.warning(
+                "Gemini returned %d (attempt %d/%d), retrying...",
+                resp.status_code,
+                attempt + 1,
+                max_attempts,
+            )
+        except httpx.TransportError as exc:
+            last_exc = exc
+            if attempt == max_attempts - 1:
+                raise
+            logger.warning(
+                "Gemini transport error %s (attempt %d/%d), retrying...",
+                exc,
+                attempt + 1,
+                max_attempts,
+            )
+        await asyncio.sleep(0.8 * (2**attempt))
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Unreachable retry loop exit")
 
 
 def pcm_to_wav_bytes(
@@ -73,12 +124,12 @@ async def call_gemini_text(
     if enable_google_search:
         payload["tools"] = [{"google_search": {}}]
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(
-            url,
-            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json=payload,
-        )
+    try:
+        resp = await _post_gemini_with_retry(url, api_key, payload, timeout=60.0)
+    except httpx.TransportError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Gemini network error ({model}): {exc}"
+        ) from exc
 
     if resp.status_code != 200:
         err_text = resp.text
@@ -154,15 +205,16 @@ async def call_gemini_tts(
         },
     }
 
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        resp = await client.post(
-            url,
-            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json=payload,
-        )
+    try:
+        resp = await _post_gemini_with_retry(url, api_key, payload, timeout=90.0)
+    except httpx.TransportError as exc:
+        logger.warning("[TTS Warning] %s network error: %s", tts_model, exc)
+        return None
 
     if resp.status_code != 200:
-        print(f"[TTS Warning] {tts_model} returned {resp.status_code}: {resp.text[:300]}")
+        logger.warning(
+            "[TTS Warning] %s returned %d: %s", tts_model, resp.status_code, resp.text[:300]
+        )
         return None
 
     data = resp.json()
