@@ -691,6 +691,7 @@
     let wakeLockSentinel = null;
     let keepAliveAudio = null;
     let authPromptInFlight = false;
+    let pingInFlight = false;
 
     const mainAudio = document.getElementById("mainAudio");
     const audioBar = document.getElementById("audioBar");
@@ -829,6 +830,8 @@
 
     async function sendPing(audioJustEnded = false) {
       if (!currentCoords) return;
+      if (pingInFlight && !audioJustEnded) return;
+      pingInFlight = true;
       try {
         const res = await apiFetch("/api/ping", {
           method: "POST",
@@ -852,6 +855,8 @@
         }
       } catch (err) {
         console.warn("Ping failed:", err);
+      } finally {
+        pingInFlight = false;
       }
     }
 
@@ -917,7 +922,9 @@
 
         const data = await res.json();
         if (!res.ok) {
-          addSystemBanner(`Error: ${data.detail || res.statusText}`);
+          if (res.status !== 409) {
+            addSystemBanner(`Error: ${data.detail || res.statusText}`);
+          }
           return;
         }
 
@@ -946,7 +953,7 @@
 
       // Optimistically render user message
       document.getElementById("emptyState").style.display = "none";
-      appendMessageCard({
+      const userCard = appendMessageCard({
         role: "user",
         text: text,
         location_label: currentCoords?.short_label,
@@ -964,12 +971,16 @@
         });
         const data = await res.json();
         if (!res.ok) {
+          userCard?.remove();
+          input.value = text;
           addSystemBanner(`Error: ${data.detail || res.statusText}`);
           return;
         }
         appendMessageCard(data.assistant_message, true);
         updateLocationHeader(currentCoords, data.trigger_status);
       } catch (err) {
+        userCard?.remove();
+        input.value = text;
         addSystemBanner(`Chat error: ${err.message}`);
       } finally {
         isGenerating = false;
@@ -1022,13 +1033,14 @@
         let sourcesHtml = "";
         if (msg.sources && msg.sources.length > 0) {
           const links = msg.sources
+            .filter((s) => typeof s.uri === "string" && /^https?:\/\//i.test(s.uri))
             .map((s) => `<a class="source-link" href="${escapeHtml(s.uri)}" target="_blank" rel="noopener">${escapeHtml(s.title)}</a>`)
             .join("");
           sourcesHtml = `<div class="sources-list">${links}</div>`;
         }
 
         const playBtnHtml = msg.audio_url
-          ? `<button class="play-clip-btn" onclick="playAudioUrl('${msg.audio_url}', '${escapeJs(locTitle)}', '${escapeJs(msg.lens?.name || "Hear")}')">▶ Play Audio</button>`
+          ? `<button class="play-clip-btn" data-audio-url="${escapeHtml(msg.audio_url)}" data-title="${escapeHtml(locTitle)}" data-subtitle="${escapeHtml(msg.lens?.name || "Hear")}" onclick="playAudioUrl(this.dataset.audioUrl, this.dataset.title, this.dataset.subtitle)">▶ Play Audio</button>`
           : `<button class="play-clip-btn" onclick="speakBrowserTts(this.dataset.text)" data-text="${escapeHtml(msg.text)}">🔊 Speak (Browser)</button>`;
 
         card.innerHTML = `
@@ -1054,6 +1066,7 @@
           speakBrowserTts(msg.text);
         }
       }
+      return card;
     }
 
     function addSystemBanner(text) {
@@ -1438,11 +1451,8 @@
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-    }
-
-    function escapeJs(str) {
-      return String(str || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
 
     init();

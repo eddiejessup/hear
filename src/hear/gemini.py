@@ -18,8 +18,23 @@ from hear.paths import AUDIO_DIR
 logger = logging.getLogger(__name__)
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+MAX_AUDIO_FILES = 25
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 _http_client: httpx.AsyncClient | None = None
+
+
+def prune_old_audio_files(max_files: int = MAX_AUDIO_FILES) -> None:
+    """Keep only the newest `max_files` WAV files in AUDIO_DIR to bound tmpfs/disk usage."""
+    try:
+        wav_files = sorted(
+            AUDIO_DIR.glob("*.wav"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in wav_files[max_files:]:
+            stale.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Failed to prune old audio files: %s", exc)
 
 
 def get_gemini_http_client() -> httpx.AsyncClient:
@@ -236,6 +251,7 @@ async def call_gemini_tts(
             audio_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
             wav_path = AUDIO_DIR / f"{audio_id}.wav"
             wav_path.write_bytes(wav_bytes)
+            prune_old_audio_files()
             return f"/api/audio/{audio_id}.wav"
 
     return None

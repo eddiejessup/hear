@@ -1,3 +1,5 @@
+from pydantic import Field
+
 from hear.models.common import HearModel
 from hear.models.config import AppConfig
 from hear.models.session import (
@@ -12,9 +14,9 @@ from hear.models.session import (
 
 
 class PingRequest(HearModel):
-    lat: float
-    lon: float
-    accuracy: float | None = None
+    lat: float = Field(ge=-90.0, le=90.0)
+    lon: float = Field(ge=-180.0, le=180.0)
+    accuracy: float | None = Field(default=None, ge=0.0)
     heading: float | None = None
     speed: float | None = None
     is_playing_audio: bool = False
@@ -22,8 +24,8 @@ class PingRequest(HearModel):
 
 
 class NarrateRequest(HearModel):
-    lat: float | None = None
-    lon: float | None = None
+    lat: float | None = Field(default=None, ge=-90.0, le=90.0)
+    lon: float | None = Field(default=None, ge=-180.0, le=180.0)
     heading: float | None = None
     lens_id: str | None = None
     custom_focus: str | None = None
@@ -32,8 +34,8 @@ class NarrateRequest(HearModel):
 
 class ChatRequest(HearModel):
     message: str
-    lat: float | None = None
-    lon: float | None = None
+    lat: float | None = Field(default=None, ge=-90.0, le=90.0)
+    lon: float | None = Field(default=None, ge=-180.0, le=180.0)
 
 
 class StateResponse(HearModel):

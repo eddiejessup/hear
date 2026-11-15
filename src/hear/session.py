@@ -2,18 +2,24 @@ import asyncio
 import random
 import re
 import time
+import uuid
 from datetime import UTC, datetime
 
 from hear.gemini import call_gemini_text, call_gemini_tts
-from hear.geo import haversine_meters
+from hear.geo import compass_bearing_label, haversine_meters
 from hear.models.config import AppConfig, LensConfig
 from hear.models.gemini import GeminiContent, GeminiPart, GeminiTextResult
+from hear.models.geo import GeoContext
 from hear.models.session import (
+    AssistantMessage,
     CurrentLocation,
+    LensSummary,
+    MessageLocation,
     SessionTranscript,
     TriggerLocation,
     TriggerStatus,
     UIMessage,
+    UserChatMessage,
 )
 from hear.paths import SESSIONS_DIR
 
@@ -210,6 +216,144 @@ class WalkSession:
             is_generating=self.is_generating,
             is_playing_audio=self.is_playing_audio,
         )
+
+    def should_prefetch_overpass(self, config: AppConfig, lat: float, lon: float) -> bool:
+        """Return True if the user is approaching a narration trigger (>75% of min_distance)."""
+        trig = config.triggers
+        if not trig.auto_trigger_enabled or self.is_generating or self.is_playing_audio:
+            return False
+        if self.last_trigger_location is None:
+            return True
+        dist_m = haversine_meters(
+            lat,
+            lon,
+            self.last_trigger_location.lat,
+            self.last_trigger_location.lon,
+        )
+        return dist_m >= 0.75 * trig.min_distance_meters
+
+    @staticmethod
+    def build_narration_prompt(
+        lat: float,
+        lon: float,
+        heading: float | None,
+        geo: GeoContext,
+        lens: LensConfig,
+        custom_focus: str | None = None,
+    ) -> str:
+        compass = compass_bearing_label(heading)
+        nearby_str = (
+            "\nNearby mapped features (within 150m): " + "; ".join(geo.nearby_features)
+            if geo.nearby_features
+            else ""
+        )
+        heading_str = f" | Heading: {compass}" if compass else ""
+        focus_str = (
+            f"\nAdditional user request for this stop: {custom_focus}" if custom_focus else ""
+        )
+        return (
+            f"[LOCATION TRIGGER — {geo.short_label}]\n"
+            f"Coordinates: {lat:.5f}, {lon:.5f}{heading_str}\n"
+            f"Full address context: {geo.full_address}"
+            f"{nearby_str}\n\n"
+            f"Selected Lens ({lens.name}): {lens.prompt}"
+            f"{focus_str}\n\n"
+            "Narrate an insightful historical segment about this location "
+            "through the selected lens."
+        )
+
+    async def execute_narration_turn(
+        self,
+        config: AppConfig,
+        lat: float,
+        lon: float,
+        heading: float | None,
+        geo: GeoContext,
+        requested_lens_id: str | None = None,
+        custom_focus: str | None = None,
+        reason: str | None = "manual",
+    ) -> AssistantMessage:
+        lens = self.sample_lens(config, requested_lens_id=requested_lens_id)
+        location_prompt = self.build_narration_prompt(
+            lat=lat,
+            lon=lon,
+            heading=heading,
+            geo=geo,
+            lens=lens,
+            custom_focus=custom_focus,
+        )
+        llm_result, audio_url, now = await self.run_gemini_turn(config, location_prompt)
+
+        self.last_trigger_location = TriggerLocation(
+            lat=lat,
+            lon=lon,
+            short_label=geo.short_label,
+            timestamp=now,
+        )
+
+        msg_record = AssistantMessage(
+            id=uuid.uuid4().hex[:10],
+            type="narration",
+            timestamp=now,
+            location=MessageLocation(
+                lat=lat,
+                lon=lon,
+                short_label=geo.short_label,
+                nearby_features=geo.nearby_features,
+            ),
+            lens=LensSummary(id=lens.id, name=lens.name),
+            reason=reason,
+            model=config.gemini.model,
+            text=llm_result.text,
+            audio_url=audio_url,
+            sources=llm_result.sources,
+            search_queries=llm_result.search_queries,
+        )
+        self.ui_messages.append(msg_record)
+        self.persist_transcript()
+        return msg_record
+
+    async def execute_chat_turn(
+        self,
+        config: AppConfig,
+        cleaned_message: str,
+        lat: float | None,
+        lon: float | None,
+        short_label: str | None,
+    ) -> tuple[UserChatMessage, AssistantMessage]:
+        loc_prefix = (
+            f"[User current location: {short_label} ({lat:.5f}, {lon:.5f})]\n"
+            if short_label and lat is not None and lon is not None
+            else ""
+        )
+        user_msg_ui = UserChatMessage(
+            id=uuid.uuid4().hex[:10],
+            timestamp=time.time(),
+            location_label=short_label,
+            text=cleaned_message,
+        )
+        user_prompt_text = f"{loc_prefix}User message: {cleaned_message}"
+        llm_result, audio_url, now = await self.run_gemini_turn(config, user_prompt_text)
+
+        assistant_msg_ui = AssistantMessage(
+            id=uuid.uuid4().hex[:10],
+            type="chat_reply",
+            timestamp=now,
+            location=(
+                MessageLocation(lat=lat, lon=lon, short_label=short_label)
+                if short_label and lat is not None and lon is not None
+                else None
+            ),
+            model=config.gemini.model,
+            text=llm_result.text,
+            audio_url=audio_url,
+            sources=llm_result.sources,
+            search_queries=llm_result.search_queries,
+        )
+        self.ui_messages.append(user_msg_ui)
+        self.ui_messages.append(assistant_msg_ui)
+        self.persist_transcript()
+        return user_msg_ui, assistant_msg_ui
 
     def persist_transcript(self) -> None:
         out_file = SESSIONS_DIR / f"session_{self.session_id}.json"

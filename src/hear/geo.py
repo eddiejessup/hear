@@ -126,12 +126,13 @@ geo_cache = GeoCache()
 
 async def _fetch_nominatim(
     client: httpx.AsyncClient, lat: float, lon: float
-) -> tuple[str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, bool]:
     short_label = f"{lat:.5f}, {lon:.5f}"
     full_address = short_label
     road = ""
     neighborhood = ""
     city = ""
+    ok = False
 
     try:
         resp = await client.get(
@@ -147,6 +148,7 @@ async def _fetch_nominatim(
         )
         if resp.status_code == 200:
             data = resp.json()
+            ok = True
             full_address = str(data.get("display_name") or full_address)
             addr = data.get("address") or {}
             road = str(
@@ -184,13 +186,15 @@ async def _fetch_nominatim(
                 parts.append(city)
             if parts:
                 short_label = ", ".join(parts)
-    except httpx.HTTPError:
+    except httpx.HTTPError, ValueError:
         pass
 
-    return short_label, full_address, road, neighborhood, city
+    return short_label, full_address, road, neighborhood, city, ok
 
 
-async def _fetch_overpass(client: httpx.AsyncClient, lat: float, lon: float) -> list[str]:
+async def _fetch_overpass(
+    client: httpx.AsyncClient, lat: float, lon: float
+) -> tuple[list[str], bool]:
     overpass_query = f"""
     [out:json][timeout:4];
     (
@@ -206,6 +210,7 @@ async def _fetch_overpass(client: httpx.AsyncClient, lat: float, lon: float) -> 
     out tags center 15;
     """
     nearby_features: list[str] = []
+    ok = False
     try:
         ov_resp = await client.post(
             "https://overpass-api.de/api/interpreter",
@@ -214,6 +219,7 @@ async def _fetch_overpass(client: httpx.AsyncClient, lat: float, lon: float) -> 
         )
         if ov_resp.status_code == 200:
             elements = ov_resp.json().get("elements", [])
+            ok = True
             seen: set[str] = set()
             for el in elements:
                 tags = el.get("tags") or {}
@@ -238,9 +244,9 @@ async def _fetch_overpass(client: httpx.AsyncClient, lat: float, lon: float) -> 
                     extra.append(f"wiki: {tags['wikipedia']}")
                 suffix = f" ({kind}{', ' + ', '.join(extra) if extra else ''})"
                 nearby_features.append(f"{name}{suffix}")
-    except httpx.HTTPError:
+    except httpx.HTTPError, ValueError:
         pass
-    return nearby_features[:10]
+    return nearby_features[:10], ok
 
 
 async def reverse_geocode_and_context(
@@ -254,23 +260,26 @@ async def reverse_geocode_and_context(
     client = get_geo_http_client()
 
     if entry is not None and include_overpass and not entry.has_overpass:
-        nearby_features = await _fetch_overpass(client, lat, lon)
+        nearby_features, ov_ok = await _fetch_overpass(client, lat, lon)
         upgraded = entry.result.model_copy(update={"nearby_features": nearby_features})
-        return geo_cache.set(lat, lon, upgraded, has_overpass=True)
+        if ov_ok:
+            return geo_cache.set(lat, lon, upgraded, has_overpass=True)
+        return upgraded
 
     if include_overpass:
         (
-            (short_label, full_address, road, neighborhood, city),
-            nearby_features,
+            (short_label, full_address, road, neighborhood, city, nom_ok),
+            (nearby_features, ov_ok),
         ) = await asyncio.gather(
             _fetch_nominatim(client, lat, lon),
             _fetch_overpass(client, lat, lon),
         )
     else:
-        short_label, full_address, road, neighborhood, city = await _fetch_nominatim(
+        short_label, full_address, road, neighborhood, city, nom_ok = await _fetch_nominatim(
             client, lat, lon
         )
         nearby_features = []
+        ov_ok = False
 
     result = GeoContext(
         lat=lat,
@@ -282,4 +291,6 @@ async def reverse_geocode_and_context(
         city=city,
         nearby_features=nearby_features,
     )
-    return geo_cache.set(lat, lon, result, has_overpass=include_overpass)
+    if nom_ok:
+        return geo_cache.set(lat, lon, result, has_overpass=include_overpass and ov_ok)
+    return result
