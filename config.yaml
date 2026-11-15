@@ -5,9 +5,8 @@ gemini:
   tts_enabled: true
   tts_model: gemini-3.8-flash-tts
   tts_voice: Charon
-  tts_style_prompt: Read this aloud in the voice of a sharp, dryly engaging historian and essayist recording
-    an outdoor walking podcast. Speak at a natural, measured conversational pace—never overly chipper
-    or like a tourist brochure.
+  tts_style_prompt: sharp, dryly engaging historian and essayist, calm and measured outdoor walking podcast
+    pace, never overly chipper or like a tourist brochure
 triggers:
   auto_trigger_enabled: false
   min_distance_meters: 120

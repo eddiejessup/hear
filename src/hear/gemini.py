@@ -201,13 +201,12 @@ async def call_gemini_tts(
     url = f"{GEMINI_API_BASE}/models/{tts_model}:generateContent"
 
     clean_text = re.sub(r"[*_#`~]+", "", text).strip()
-    if style_prompt:
-        prompt_text = f"{style_prompt.strip()}\n\nTranscript to read aloud:\n{clean_text}"
-    else:
-        prompt_text = clean_text
+    part: dict[str, Any] = {"text": clean_text}
+    if style_prompt.strip():
+        part["speechMetadata"] = {"style": style_prompt.strip()}
 
     payload: dict[str, Any] = {
-        "contents": [{"parts": [{"text": prompt_text}]}],
+        "contents": [{"role": "user", "parts": [part]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {
