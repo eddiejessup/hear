@@ -1,17 +1,37 @@
+import os
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from hear.auth import get_expected_auth_token, is_unauthenticated_allowed, verify_token
 from hear.config import config_manager
 from hear.gemini import call_gemini_text, call_gemini_tts, get_api_key
 from hear.geo import compass_bearing_label, reverse_geocode_and_context
-from hear.models import AppConfig, ChatRequest, NarrateRequest, PingRequest
+from hear.models import (
+    AppConfig,
+    AssistantMessage,
+    ChatRequest,
+    ChatResponse,
+    CurrentLocation,
+    GeminiContent,
+    GeminiPart,
+    LensSummary,
+    MessageLocation,
+    NarrateRequest,
+    NarrateResponse,
+    PingRequest,
+    PingResponse,
+    ResetSessionResponse,
+    StateResponse,
+    TriggerLocation,
+    UpdateConfigResponse,
+    UserChatMessage,
+)
 from hear.paths import AUDIO_DIR, STATIC_DIR, ensure_dirs
 from hear.session import session
 
@@ -19,12 +39,33 @@ ensure_dirs()
 
 app = FastAPI(title="Hear — Historical Walking Companion")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+@app.middleware("http")
+async def auth_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    if not request.url.path.startswith("/api/"):
+        return await call_next(request)
+
+    expected = get_expected_auth_token()
+    if not expected:
+        if is_unauthenticated_allowed():
+            return await call_next(request)
+        return JSONResponse(
+            {
+                "detail": (
+                    "Server authentication is not configured. "
+                    "Set HEAR_AUTH_TOKEN (or HEAR_ALLOW_UNAUTHENTICATED=1 for local dev)."
+                )
+            },
+            status_code=503,
+        )
+
+    provided = request.headers.get("x-hear-token") or request.cookies.get("hear_token") or ""
+    if not verify_token(provided, expected):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+    return await call_next(request)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -36,7 +77,7 @@ async def index() -> HTMLResponse:
 
 
 @app.get("/api/state")
-async def get_state() -> dict[str, Any]:
+async def get_state() -> StateResponse:
     cfg = config_manager.get()
     has_api_key = True
     try:
@@ -44,20 +85,20 @@ async def get_state() -> dict[str, Any]:
     except HTTPException:
         has_api_key = False
 
-    return {
-        "session_id": session.session_id,
-        "has_api_key": has_api_key,
-        "current_location": session.current_location,
-        "last_trigger_location": session.last_trigger_location,
-        "messages": session.ui_messages,
-        "used_lens_ids": session.used_lens_ids,
-        "trigger_status": session.compute_trigger_status(cfg),
-        "config": cfg,
-    }
+    return StateResponse(
+        session_id=session.session_id,
+        has_api_key=has_api_key,
+        current_location=session.current_location,
+        last_trigger_location=session.last_trigger_location,
+        messages=session.ui_messages,
+        used_lens_ids=session.used_lens_ids,
+        trigger_status=session.compute_trigger_status(cfg),
+        config=cfg,
+    )
 
 
 @app.post("/api/ping")
-async def ping_location(req: PingRequest) -> dict[str, Any]:
+async def ping_location(req: PingRequest) -> PingResponse:
     cfg = config_manager.get()
 
     if req.audio_just_ended or (session.is_playing_audio and not req.is_playing_audio):
@@ -65,49 +106,46 @@ async def ping_location(req: PingRequest) -> dict[str, Any]:
     session.is_playing_audio = req.is_playing_audio
 
     geo = await reverse_geocode_and_context(req.lat, req.lon, include_overpass=False)
-    session.current_location = {
-        "lat": req.lat,
-        "lon": req.lon,
-        "accuracy": req.accuracy,
-        "heading": req.heading,
-        "speed": req.speed,
-        "short_label": geo["short_label"],
-        "full_address": geo["full_address"],
-        "timestamp": time.time(),
-    }
+    cur_loc = CurrentLocation(
+        lat=req.lat,
+        lon=req.lon,
+        accuracy=req.accuracy,
+        heading=req.heading,
+        speed=req.speed,
+        short_label=geo.short_label,
+        full_address=geo.full_address,
+        timestamp=time.time(),
+    )
+    session.current_location = cur_loc
 
     status = session.compute_trigger_status(cfg)
-    return {
-        "location": session.current_location,
-        "trigger_status": status,
-    }
+    return PingResponse(
+        location=cur_loc,
+        trigger_status=status,
+    )
 
 
 @app.post("/api/narrate")
-async def trigger_narration(req: NarrateRequest) -> dict[str, Any]:
+async def trigger_narration(req: NarrateRequest) -> NarrateResponse:
     async with session.lock:
         cfg = config_manager.get()
-        cur_loc = session.current_location or {}
-        lat = req.lat if req.lat is not None else cur_loc.get("lat")
-        lon = req.lon if req.lon is not None else cur_loc.get("lon")
-        heading = req.heading if req.heading is not None else cur_loc.get("heading")
+        cur_loc = session.current_location
+        lat = req.lat if req.lat is not None else (cur_loc.lat if cur_loc else None)
+        lon = req.lon if req.lon is not None else (cur_loc.lon if cur_loc else None)
+        heading = req.heading if req.heading is not None else (cur_loc.heading if cur_loc else None)
 
         if lat is None or lon is None:
             raise HTTPException(status_code=400, detail="No GPS coordinates available yet.")
 
-        lat_f = float(lat)
-        lon_f = float(lon)
-        heading_f = float(heading) if heading is not None else None
-
         session.is_generating = True
         try:
-            geo = await reverse_geocode_and_context(lat_f, lon_f, include_overpass=True)
+            geo = await reverse_geocode_and_context(lat, lon, include_overpass=True)
             lens = session.sample_lens(cfg, requested_lens_id=req.lens_id)
 
-            compass = compass_bearing_label(heading_f)
+            compass = compass_bearing_label(heading)
             nearby_str = (
-                "\nNearby mapped features (within 150m): " + "; ".join(geo["nearby_features"])
-                if geo["nearby_features"]
+                "\nNearby mapped features (within 150m): " + "; ".join(geo.nearby_features)
+                if geo.nearby_features
                 else ""
             )
             heading_str = f" | Heading: {compass}" if compass else ""
@@ -121,9 +159,9 @@ async def trigger_narration(req: NarrateRequest) -> dict[str, Any]:
             lens_prompt = lens.prompt
 
             location_prompt = (
-                f"[LOCATION TRIGGER — {geo['short_label']}]\n"
-                f"Coordinates: {lat_f:.5f}, {lon_f:.5f}{heading_str}\n"
-                f"Full address context: {geo['full_address']}"
+                f"[LOCATION TRIGGER — {geo.short_label}]\n"
+                f"Coordinates: {lat:.5f}, {lon:.5f}{heading_str}\n"
+                f"Full address context: {geo.full_address}"
                 f"{nearby_str}\n\n"
                 f"Selected Lens ({lens_name}): {lens_prompt}"
                 f"{focus_str}\n\n"
@@ -137,10 +175,8 @@ async def trigger_narration(req: NarrateRequest) -> dict[str, Any]:
             enable_search = gemini_cfg.enable_google_search
             system_prompt = cfg.system_prompt
 
-            trial_contents = [
-                *session.gemini_contents,
-                {"role": "user", "parts": [{"text": location_prompt}]},
-            ]
+            user_turn = GeminiContent(role="user", parts=[GeminiPart(text=location_prompt)])
+            trial_contents: list[GeminiContent] = [*session.gemini_contents, user_turn]
 
             llm_result = await call_gemini_text(
                 contents=trial_contents,
@@ -150,7 +186,7 @@ async def trigger_narration(req: NarrateRequest) -> dict[str, Any]:
                 enable_google_search=enable_search,
             )
 
-            reply_text = llm_result["text"]
+            reply_text = llm_result.text
 
             audio_url: str | None = None
             if gemini_cfg.tts_enabled:
@@ -162,79 +198,72 @@ async def trigger_narration(req: NarrateRequest) -> dict[str, Any]:
                 )
 
             now = time.time()
-            session.gemini_contents = [
-                *trial_contents,
-                {"role": "model", "parts": [{"text": reply_text}]},
-            ]
-            session.last_trigger_location = {
-                "lat": lat_f,
-                "lon": lon_f,
-                "short_label": geo["short_label"],
-                "timestamp": now,
-            }
+            model_turn = GeminiContent(role="model", parts=[GeminiPart(text=reply_text)])
+            session.gemini_contents = [*trial_contents, model_turn]
+            session.last_trigger_location = TriggerLocation(
+                lat=lat,
+                lon=lon,
+                short_label=geo.short_label,
+                timestamp=now,
+            )
             session.last_trigger_time = now
             session.last_audio_ended_at = now
 
-            msg_record: dict[str, Any] = {
-                "id": uuid.uuid4().hex[:10],
-                "role": "assistant",
-                "type": "narration",
-                "timestamp": now,
-                "location": {
-                    "lat": lat_f,
-                    "lon": lon_f,
-                    "short_label": geo["short_label"],
-                    "nearby_features": geo["nearby_features"],
-                },
-                "lens": {"id": lens.id, "name": lens_name},
-                "reason": req.reason,
-                "model": model_name,
-                "text": reply_text,
-                "audio_url": audio_url,
-                "sources": llm_result["sources"],
-                "search_queries": llm_result["search_queries"],
-            }
+            msg_record = AssistantMessage(
+                id=uuid.uuid4().hex[:10],
+                type="narration",
+                timestamp=now,
+                location=MessageLocation(
+                    lat=lat,
+                    lon=lon,
+                    short_label=geo.short_label,
+                    nearby_features=geo.nearby_features,
+                ),
+                lens=LensSummary(id=lens.id, name=lens_name),
+                reason=req.reason,
+                model=model_name,
+                text=reply_text,
+                audio_url=audio_url,
+                sources=llm_result.sources,
+                search_queries=llm_result.search_queries,
+            )
             session.ui_messages.append(msg_record)
             session.persist_transcript()
 
-            return {
-                "message": msg_record,
-                "trigger_status": session.compute_trigger_status(cfg),
-            }
+            return NarrateResponse(
+                message=msg_record,
+                trigger_status=session.compute_trigger_status(cfg),
+            )
         finally:
             session.is_generating = False
 
 
 @app.post("/api/chat")
-async def steer_chat(req: ChatRequest) -> dict[str, Any]:
+async def steer_chat(req: ChatRequest) -> ChatResponse:
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Empty message.")
 
     async with session.lock:
         cfg = config_manager.get()
-        cur_loc = session.current_location or {}
-        lat = req.lat if req.lat is not None else cur_loc.get("lat")
-        lon = req.lon if req.lon is not None else cur_loc.get("lon")
+        cur_loc = session.current_location
+        lat = req.lat if req.lat is not None else (cur_loc.lat if cur_loc else None)
+        lon = req.lon if req.lon is not None else (cur_loc.lon if cur_loc else None)
 
         session.is_generating = True
         try:
             loc_prefix = ""
             short_label: str | None = None
             if lat is not None and lon is not None:
-                lat_f = float(lat)
-                lon_f = float(lon)
-                geo = await reverse_geocode_and_context(lat_f, lon_f, include_overpass=False)
-                short_label = geo["short_label"]
-                loc_prefix = f"[User current location: {short_label} ({lat_f:.5f}, {lon_f:.5f})]\n"
+                geo = await reverse_geocode_and_context(lat, lon, include_overpass=False)
+                short_label = geo.short_label
+                loc_prefix = f"[User current location: {short_label} ({lat:.5f}, {lon:.5f})]\n"
 
-            user_msg_ui: dict[str, Any] = {
-                "id": uuid.uuid4().hex[:10],
-                "role": "user",
-                "type": "chat",
-                "timestamp": time.time(),
-                "location_label": short_label,
-                "text": req.message.strip(),
-            }
+            user_msg_ui = UserChatMessage(
+                id=uuid.uuid4().hex[:10],
+                timestamp=time.time(),
+                location_label=short_label,
+                text=req.message.strip(),
+            )
             session.ui_messages.append(user_msg_ui)
 
             gemini_cfg = cfg.gemini
@@ -244,10 +273,8 @@ async def steer_chat(req: ChatRequest) -> dict[str, Any]:
             system_prompt = cfg.system_prompt
 
             user_prompt_text = f"{loc_prefix}User message: {req.message.strip()}"
-            trial_contents = [
-                *session.gemini_contents,
-                {"role": "user", "parts": [{"text": user_prompt_text}]},
-            ]
+            user_turn = GeminiContent(role="user", parts=[GeminiPart(text=user_prompt_text)])
+            trial_contents: list[GeminiContent] = [*session.gemini_contents, user_turn]
 
             llm_result = await call_gemini_text(
                 contents=trial_contents,
@@ -257,7 +284,7 @@ async def steer_chat(req: ChatRequest) -> dict[str, Any]:
                 enable_google_search=enable_search,
             )
 
-            reply_text = llm_result["text"]
+            reply_text = llm_result.text
 
             audio_url: str | None = None
             if gemini_cfg.tts_enabled:
@@ -269,36 +296,33 @@ async def steer_chat(req: ChatRequest) -> dict[str, Any]:
                 )
 
             now = time.time()
-            session.gemini_contents = [
-                *trial_contents,
-                {"role": "model", "parts": [{"text": reply_text}]},
-            ]
+            model_turn = GeminiContent(role="model", parts=[GeminiPart(text=reply_text)])
+            session.gemini_contents = [*trial_contents, model_turn]
             session.last_audio_ended_at = now
 
-            assistant_msg_ui: dict[str, Any] = {
-                "id": uuid.uuid4().hex[:10],
-                "role": "assistant",
-                "type": "chat_reply",
-                "timestamp": now,
-                "location": (
-                    {"lat": float(lat), "lon": float(lon), "short_label": short_label}
+            assistant_msg_ui = AssistantMessage(
+                id=uuid.uuid4().hex[:10],
+                type="chat_reply",
+                timestamp=now,
+                location=(
+                    MessageLocation(lat=lat, lon=lon, short_label=short_label)
                     if short_label and lat is not None and lon is not None
                     else None
                 ),
-                "model": model_name,
-                "text": reply_text,
-                "audio_url": audio_url,
-                "sources": llm_result["sources"],
-                "search_queries": llm_result["search_queries"],
-            }
+                model=model_name,
+                text=reply_text,
+                audio_url=audio_url,
+                sources=llm_result.sources,
+                search_queries=llm_result.search_queries,
+            )
             session.ui_messages.append(assistant_msg_ui)
             session.persist_transcript()
 
-            return {
-                "user_message": user_msg_ui,
-                "assistant_message": assistant_msg_ui,
-                "trigger_status": session.compute_trigger_status(cfg),
-            }
+            return ChatResponse(
+                user_message=user_msg_ui,
+                assistant_message=assistant_msg_ui,
+                trigger_status=session.compute_trigger_status(cfg),
+            )
         finally:
             session.is_generating = False
 
@@ -318,24 +342,27 @@ async def get_config() -> AppConfig:
 
 
 @app.put("/api/config")
-async def update_config(new_config: AppConfig) -> dict[str, Any]:
+async def update_config(new_config: AppConfig) -> UpdateConfigResponse:
     saved = config_manager.save(new_config)
-    return {
-        "config": saved,
-        "trigger_status": session.compute_trigger_status(saved),
-    }
+    return UpdateConfigResponse(
+        config=saved,
+        trigger_status=session.compute_trigger_status(saved),
+    )
 
 
 @app.post("/api/session/reset")
-async def reset_session() -> dict[str, Any]:
+async def reset_session() -> ResetSessionResponse:
     async with session.lock:
         session.reset()
         cfg = config_manager.get()
-        return {
-            "session_id": session.session_id,
-            "trigger_status": session.compute_trigger_status(cfg),
-        }
+        return ResetSessionResponse(
+            session_id=session.session_id,
+            trigger_status=session.compute_trigger_status(cfg),
+        )
 
 
 def main() -> None:
-    uvicorn.run("hear.app:app", host="127.0.0.1", port=8000, reload=True)
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "8000"))
+    reload_enabled = os.environ.get("HEAR_NO_RELOAD", "").lower() not in {"1", "true"}
+    uvicorn.run("hear.app:app", host=host, port=port, reload=reload_enabled)

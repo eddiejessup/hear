@@ -682,9 +682,41 @@
     let speedIdx = 0;
     let wakeLockSentinel = null;
     let keepAliveAudio = null;
+    let authPromptInFlight = false;
 
     const mainAudio = document.getElementById("mainAudio");
     const audioBar = document.getElementById("audioBar");
+
+    function syncTokenCookie(token) {
+      if (!token) return;
+      const secureFlag = location.protocol === "https:" ? "; Secure" : "";
+      document.cookie = `hear_token=${encodeURIComponent(token)}; path=/; max-age=31536000; SameSite=Strict${secureFlag}`;
+    }
+
+    async function apiFetch(url, options = {}) {
+      let token = localStorage.getItem("hear_token") || "";
+      if (token) syncTokenCookie(token);
+
+      const headers = { ...(options.headers || {}) };
+      if (token) headers["x-hear-token"] = token;
+
+      let res = await fetch(url, { ...options, headers });
+      if (res.status === 401 && !authPromptInFlight) {
+        authPromptInFlight = true;
+        try {
+          const entered = prompt("Enter Hear access token (HEAR_AUTH_TOKEN):")?.trim() || "";
+          if (entered) {
+            localStorage.setItem("hear_token", entered);
+            syncTokenCookie(entered);
+            headers["x-hear-token"] = entered;
+            res = await fetch(url, { ...options, headers });
+          }
+        } finally {
+          authPromptInFlight = false;
+        }
+      }
+      return res;
+    }
 
     // -----------------------------------------------------------------------
     // Initialization
@@ -700,7 +732,12 @@
 
     async function fetchInitialState() {
       try {
-        const res = await fetch("/api/state");
+        const res = await apiFetch("/api/state");
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          addSystemBanner(`⚠️ ${err.detail || res.statusText}`);
+          return;
+        }
         const data = await res.json();
         currentConfig = data.config;
         renderLensesStrip(currentConfig.lenses || []);
@@ -773,7 +810,7 @@
     async function sendPing(audioJustEnded = false) {
       if (!currentCoords) return;
       try {
-        const res = await fetch("/api/ping", {
+        const res = await apiFetch("/api/ping", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -846,7 +883,7 @@
       document.getElementById("cooldownBadge").textContent = "Researching…";
 
       try {
-        const res = await fetch("/api/narrate", {
+        const res = await apiFetch("/api/narrate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -896,7 +933,7 @@
       }, false);
 
       try {
-        const res = await fetch("/api/chat", {
+        const res = await apiFetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1205,7 +1242,7 @@
       startGpsWatch();
     }
     async function resetSession() {
-      const res = await fetch("/api/session/reset", { method: "POST" });
+      const res = await apiFetch("/api/session/reset", { method: "POST" });
       if (res.ok) {
         document.getElementById("feed").innerHTML = `<div id="emptyState" class="empty-state">New walk session started.</div>`;
         closeSimDrawer();
@@ -1220,7 +1257,7 @@
       currentConfig.triggers = currentConfig.triggers || {};
       currentConfig.triggers.auto_trigger_enabled = !currentConfig.triggers.auto_trigger_enabled;
       updateAutoTriggerButton(currentConfig.triggers.auto_trigger_enabled);
-      await fetch("/api/config", {
+      await apiFetch("/api/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(currentConfig),
@@ -1320,7 +1357,7 @@
       });
       updated.lenses = newLenses;
 
-      const res = await fetch("/api/config", {
+      const res = await apiFetch("/api/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(updated),

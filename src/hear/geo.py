@@ -182,15 +182,15 @@ async def reverse_geocode_and_context(
             except httpx.HTTPError:
                 pass
 
-    result: GeoContext = {
-        "lat": lat,
-        "lon": lon,
-        "short_label": short_label,
-        "full_address": full_address,
-        "road": road,
-        "neighborhood": neighborhood,
-        "city": city,
-        "nearby_features": nearby_features[:10],
-    }
+    result = GeoContext(
+        lat=lat,
+        lon=lon,
+        short_label=short_label,
+        full_address=full_address,
+        road=road,
+        neighborhood=neighborhood,
+        city=city,
+        nearby_features=nearby_features[:10],
+    )
     geo_cache.set(lat, lon, result, has_overpass=include_overpass)
     return result

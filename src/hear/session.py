@@ -1,12 +1,19 @@
 import asyncio
-import json
 import random
 import time
 from datetime import UTC, datetime
-from typing import Any
 
 from hear.geo import haversine_meters
-from hear.models import AppConfig, LensConfig
+from hear.models import (
+    AppConfig,
+    CurrentLocation,
+    GeminiContent,
+    LensConfig,
+    SessionTranscript,
+    TriggerLocation,
+    TriggerStatus,
+    UIMessage,
+)
 from hear.paths import SESSIONS_DIR
 
 
@@ -15,11 +22,11 @@ class WalkSession:
         self.lock = asyncio.Lock()
         self.session_id: str = ""
         self.started_at: float = 0.0
-        self.gemini_contents: list[dict[str, Any]] = []
-        self.ui_messages: list[dict[str, Any]] = []
+        self.gemini_contents: list[GeminiContent] = []
+        self.ui_messages: list[UIMessage] = []
         self.used_lens_ids: list[str] = []
-        self.current_location: dict[str, Any] | None = None
-        self.last_trigger_location: dict[str, Any] | None = None
+        self.current_location: CurrentLocation | None = None
+        self.last_trigger_location: TriggerLocation | None = None
         self.last_trigger_time: float | None = None
         self.last_audio_ended_at: float | None = None
         self.is_generating: bool = False
@@ -71,7 +78,7 @@ class WalkSession:
             self.used_lens_ids.append(chosen.id)
         return chosen
 
-    def compute_trigger_status(self, config: AppConfig) -> dict[str, Any]:
+    def compute_trigger_status(self, config: AppConfig) -> TriggerStatus:
         trig = config.triggers
         auto_enabled = trig.auto_trigger_enabled
         min_dist_m = trig.min_distance_meters
@@ -83,10 +90,10 @@ class WalkSession:
         dist_moved_m: float | None = None
         if self.current_location and self.last_trigger_location:
             dist_moved_m = haversine_meters(
-                float(self.current_location["lat"]),
-                float(self.current_location["lon"]),
-                float(self.last_trigger_location["lat"]),
-                float(self.last_trigger_location["lon"]),
+                self.current_location.lat,
+                self.current_location.lon,
+                self.last_trigger_location.lat,
+                self.last_trigger_location.lon,
             )
 
         ref_time = self.last_audio_ended_at or self.last_trigger_time
@@ -121,30 +128,30 @@ class WalkSession:
                         f"max_silence ({int(silence_elapsed_s)}s >= {int(max_silence_s)}s)"
                     )
 
-        return {
-            "auto_trigger_enabled": auto_enabled,
-            "should_trigger": should_trigger,
-            "trigger_reason": trigger_reason,
-            "distance_moved_m": round(dist_moved_m, 1) if dist_moved_m is not None else None,
-            "min_distance_m": min_dist_m,
-            "silence_elapsed_s": (
+        return TriggerStatus(
+            auto_trigger_enabled=auto_enabled,
+            should_trigger=should_trigger,
+            trigger_reason=trigger_reason,
+            distance_moved_m=round(dist_moved_m, 1) if dist_moved_m is not None else None,
+            min_distance_m=min_dist_m,
+            silence_elapsed_s=(
                 round(silence_elapsed_s, 1) if silence_elapsed_s is not None else None
             ),
-            "cooldown_remaining_s": round(cooldown_remaining_s, 1),
-            "min_cooldown_s": min_cooldown_s,
-            "max_silence_s": max_silence_s,
-            "is_generating": self.is_generating,
-            "is_playing_audio": self.is_playing_audio,
-        }
+            cooldown_remaining_s=round(cooldown_remaining_s, 1),
+            min_cooldown_s=min_cooldown_s,
+            max_silence_s=max_silence_s,
+            is_generating=self.is_generating,
+            is_playing_audio=self.is_playing_audio,
+        )
 
     def persist_transcript(self) -> None:
         out_file = SESSIONS_DIR / f"session_{self.session_id}.json"
-        payload = {
-            "session_id": self.session_id,
-            "started_at": self.started_at,
-            "messages": self.ui_messages,
-        }
-        out_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        transcript = SessionTranscript(
+            session_id=self.session_id,
+            started_at=self.started_at,
+            messages=self.ui_messages,
+        )
+        out_file.write_text(transcript.model_dump_json(indent=2), encoding="utf-8")
 
 
 session = WalkSession()

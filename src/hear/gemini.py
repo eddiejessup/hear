@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 from fastapi import HTTPException
 
-from hear.models import GeminiTextResult, GroundingSource
+from hear.models import GeminiContent, GeminiTextResult, GroundingSource
 from hear.paths import AUDIO_DIR, PROJECT_ROOT
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
@@ -52,7 +52,7 @@ def pcm_to_wav_bytes(
 
 
 async def call_gemini_text(
-    contents: list[dict[str, Any]],
+    contents: list[GeminiContent],
     system_prompt: str,
     model: str,
     temperature: float = 0.75,
@@ -63,7 +63,7 @@ async def call_gemini_text(
     url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
 
     payload: dict[str, Any] = {
-        "contents": contents,
+        "contents": [c.model_dump() for c in contents],
         "generationConfig": {
             "temperature": temperature,
         },
@@ -115,13 +115,13 @@ async def call_gemini_text(
         uri = web.get("uri")
         if uri and isinstance(uri, str):
             title = str(web.get("title") or uri)
-            sources.append({"title": title, "uri": uri})
+            sources.append(GroundingSource(title=title, uri=uri))
 
-    return {
-        "text": full_text,
-        "search_queries": search_queries,
-        "sources": sources[:6],
-    }
+    return GeminiTextResult(
+        text=full_text,
+        search_queries=search_queries,
+        sources=sources[:6],
+    )
 
 
 async def call_gemini_tts(

@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
+
+export PATH="/opt/homebrew/bin:/opt/homebrew/share/google-cloud-sdk/bin:$PATH"
+
+SERVICE_NAME="${SERVICE_NAME:-hear}"
+REGION="${GCP_REGION:-europe-west1}"
+PROJECT="${GCP_PROJECT:-gen-lang-client-0743073374}"
+
+echo "▸ Running pre-deploy static analysis checks..."
+./check.sh
+
+# Load .env if present
+if [[ -f ".env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source ".env"
+  set +a
+fi
+
+if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+  echo "✗ Error: GEMINI_API_KEY is not set in environment or .env" >&2
+  exit 1
+fi
+
+# Generate and persist HEAR_AUTH_TOKEN in .env if not already set
+if [[ -z "${HEAR_AUTH_TOKEN:-}" ]]; then
+  HEAR_AUTH_TOKEN="$(openssl rand -hex 24)"
+  echo "HEAR_AUTH_TOKEN=\"$HEAR_AUTH_TOKEN\"" >> .env
+  echo "▸ Generated new HEAR_AUTH_TOKEN and saved it to .env"
+fi
+
+echo "▸ Ensuring required GCP APIs (Cloud Run, Cloud Build, Artifact Registry) are enabled..."
+gcloud services enable \
+  --project "$PROJECT" \
+  --quiet \
+  run.googleapis.com \
+  cloudbuild.googleapis.com \
+  artifactregistry.googleapis.com
+
+# Cloud Run '--source .' builds with the project's default Compute Engine service account,
+# which on newly created GCP projects requires Cloud Build & Service Usage roles.
+PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')"
+COMPUTE_SA="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+echo "▸ Ensuring Cloud Build IAM roles on ${COMPUTE_SA}..."
+for ROLE in "roles/cloudbuild.builds.builder" "roles/serviceusage.serviceUsageConsumer"; do
+  gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member="$COMPUTE_SA" \
+    --role="$ROLE" \
+    --condition=None \
+    --quiet >/dev/null
+done
+
+echo "▸ Deploying '$SERVICE_NAME' to Cloud Run (project: $PROJECT, region: $REGION, max-instances: 1)..."
+gcloud run deploy "$SERVICE_NAME" \
+  --project "$PROJECT" \
+  --quiet \
+  --source . \
+  --region "$REGION" \
+  --allow-unauthenticated \
+  --max-instances 1 \
+  --memory 512Mi \
+  --cpu 1 \
+  --timeout 120 \
+  --set-env-vars "GEMINI_API_KEY=${GEMINI_API_KEY},HEAR_AUTH_TOKEN=${HEAR_AUTH_TOKEN}"
+
+echo ""
+echo "✓ Deployment complete!"
+echo "  Access token for your phone browser (HEAR_AUTH_TOKEN):"
+echo "  ${HEAR_AUTH_TOKEN}"
