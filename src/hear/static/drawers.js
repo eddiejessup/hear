@@ -1,8 +1,8 @@
 import { apiFetch } from "./api.js";
 import {
-  GpsState,
   escapeHtml,
   formatUptime,
+  GpsState,
   parseNonNegativeFloat,
   patchSection,
   setTopLevelState,
@@ -116,7 +116,11 @@ export function createDrawersController({
   }
 
   function resumeRealGps() {
-    patchSection("gps", { simulated: false, status: GpsState.WAITING, lastError: null }, "gps_real");
+    patchSection(
+      "gps",
+      { simulated: false, status: GpsState.WAITING, lastError: null },
+      "gps_real"
+    );
     closeSimDrawer();
     startGpsWatch();
   }
@@ -227,7 +231,11 @@ export function createDrawersController({
     const g = state.currentConfig.gemini || {};
     const t = state.currentConfig.triggers || {};
 
-    setSelectValuePreservingCustom(document.getElementById("cfgModel"), g.model, "gemini-3.8-flash");
+    setSelectValuePreservingCustom(
+      document.getElementById("cfgModel"),
+      g.model,
+      "gemini-3.8-flash"
+    );
     setSelectValuePreservingCustom(document.getElementById("cfgVoice"), g.tts_voice, "Charon");
     document.getElementById("cfgTtsEnabled").value = String(g.tts_enabled ?? true);
     document.getElementById("cfgTtsStyle").value = g.tts_style_prompt || "";

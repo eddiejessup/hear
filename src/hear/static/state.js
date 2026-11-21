@@ -65,9 +65,10 @@ export const appState = {
     updatedAt: null,
   },
   network: {
-    status: typeof navigator !== "undefined" && navigator.onLine === false
-      ? NetworkState.OFFLINE
-      : NetworkState.IDLE,
+    status:
+      typeof navigator !== "undefined" && navigator.onLine === false
+        ? NetworkState.OFFLINE
+        : NetworkState.IDLE,
     pingInFlight: false,
     lastPingAt: null,
     lastPingSnapshot: null,
@@ -140,7 +141,7 @@ export function getEffectiveGpsStatus(state = appState, nowMs = Date.now()) {
 
 export function getEstimatedCooldownRemaining(state = appState, nowMs = Date.now()) {
   const trig = state.trigger.status;
-  if (!trig || !trig.cooldown_remaining_s || trig.cooldown_remaining_s <= 0) return 0;
+  if (!trig?.cooldown_remaining_s || trig.cooldown_remaining_s <= 0) return 0;
   const elapsedSinceUpdateS = state.trigger.updatedAt
     ? Math.max(0, (nowMs - state.trigger.updatedAt) / 1000)
     : 0;
@@ -155,8 +156,7 @@ export function computeTriggerGate(state = appState, nowMs = Date.now()) {
     const elapsedS = state.generation.startedAt
       ? Math.max(0, Math.floor((nowMs - state.generation.startedAt) / 1000))
       : null;
-    const verb =
-      state.generation.status === GenerationState.CHATTING ? "Replying" : "Researching";
+    const verb = state.generation.status === GenerationState.CHATTING ? "Replying" : "Researching";
     return {
       code: "generating",
       label: elapsedS !== null && elapsedS > 0 ? `${verb}… ${elapsedS}s` : `${verb}…`,

@@ -28,7 +28,10 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
-      - name: Run static analysis (ruff + ty)
+      - name: Set up Biome
+        uses: biomejs/setup-biome@v2
+
+      - name: Run static analysis (ruff + biome + ty)
         run: ./deploy/check.sh
 
       - name: Authenticate to Google Cloud

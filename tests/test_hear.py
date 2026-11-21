@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -401,6 +402,26 @@ class TestAudioPruningAndAuth(unittest.TestCase):
                 ):
                     resp = client.get(asset)
                     self.assertEqual(resp.status_code, 200, f"Failed to serve {asset}")
+
+    def test_static_frontend_dom_ids_and_imports_integrity(self) -> None:
+        static_dir = AppPaths.from_env().static_dir
+        html = (static_dir / "index.html").read_text(encoding="utf-8")
+        html_ids = set(re.findall(r'\bid="([^"]+)"', html))
+
+        for js_file in sorted(static_dir.glob("*.js")):
+            src = js_file.read_text(encoding="utf-8")
+            for rel_import in re.findall(r'from\s+["\'](\.[^"\']+)["\']', src):
+                target = (js_file.parent / rel_import).resolve()
+                self.assertTrue(
+                    target.is_file(),
+                    f"Broken relative JS import '{rel_import}' in {js_file.name}",
+                )
+            for dom_id in re.findall(r'getElementById\(\s*["\']([^"\']+)["\']\s*\)', src):
+                self.assertIn(
+                    dom_id,
+                    html_ids,
+                    f"Missing DOM id='{dom_id}' in index.html (referenced by {js_file.name})",
+                )
 
     def test_empty_gemini_response_raises_502(self) -> None:
         fake_resp = httpx.Response(

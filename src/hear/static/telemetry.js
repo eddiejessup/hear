@@ -49,10 +49,9 @@ export function createTelemetryClient({
   state,
   endpoint = "/api/events",
   fetchFn = typeof fetch === "function" ? fetch.bind(globalThis) : null,
-  sendBeaconFn =
-    typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function"
-      ? navigator.sendBeacon.bind(navigator)
-      : null,
+  sendBeaconFn = typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function"
+    ? navigator.sendBeacon.bind(navigator)
+    : null,
   getToken = getAuthToken,
   getClient = getClientId,
 } = {}) {

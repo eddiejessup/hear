@@ -1,30 +1,26 @@
 import { apiFetch } from "./api.js";
 import { createAudioController } from "./audio.js";
+import { createDrawersController, renderDebugInfo, updateAutoTriggerButton } from "./drawers.js";
 import {
-  createDrawersController,
-  renderDebugInfo,
-  updateAutoTriggerButton,
-} from "./drawers.js";
-import {
-  GenerationState,
-  GpsState,
-  NetworkState,
-  WakeLockState,
-  appState,
   approxDistanceMeters,
+  appState,
   computeTriggerGate,
   escapeHtml,
   formatAgeShort,
+  GenerationState,
+  GpsState,
   getEffectiveGpsStatus,
   getEstimatedCooldownRemaining,
   isGenerating,
   isPausedAudio,
   isPlayingAudio,
+  NetworkState,
   patchSection,
   setTopLevelState,
   subscribeState,
+  WakeLockState,
 } from "./state.js";
-import { FrontendEventType, TelemetryLevel, createTelemetryClient } from "./telemetry.js";
+import { createTelemetryClient, FrontendEventType, TelemetryLevel } from "./telemetry.js";
 
 const mainAudio = document.getElementById("mainAudio");
 const audioBar = document.getElementById("audioBar");
@@ -148,7 +144,7 @@ function renderStateUI() {
 
   // 7. Collapsible State Inspector panel (only render DOM when expanded)
   const panel = document.getElementById("stateInspectorPanel");
-  if (panel && panel.classList.contains("open")) {
+  if (panel?.classList.contains("open")) {
     const coordStr = coords
       ? `${coords.lat.toFixed(5)}, ${coords.lon.toFixed(5)}${coords.accuracy ? ` (±${Math.round(coords.accuracy)}m)` : ""}`
       : "--";
@@ -223,9 +219,7 @@ function bindDomEvents() {
     renderStateUI();
   });
 
-  document
-    .getElementById("narrateBtn")
-    .addEventListener("click", () => triggerNarration("manual"));
+  document.getElementById("narrateBtn").addEventListener("click", () => triggerNarration("manual"));
   speedBtn.addEventListener("click", audio.cycleSpeed);
 
   document.getElementById("chatForm").addEventListener("submit", sendChat);
@@ -261,7 +255,9 @@ function bindDomEvents() {
     });
   });
   document.getElementById("applySimBtn").addEventListener("click", drawers.applySimCoords);
-  document.getElementById("nudgeNorthBtn").addEventListener("click", () => drawers.nudgeSim(150, 0));
+  document
+    .getElementById("nudgeNorthBtn")
+    .addEventListener("click", () => drawers.nudgeSim(150, 0));
   document.getElementById("nudgeEastBtn").addEventListener("click", () => drawers.nudgeSim(0, 150));
   document.getElementById("resumeGpsBtn").addEventListener("click", drawers.resumeRealGps);
   document.getElementById("resetSessionBtn").addEventListener("click", drawers.resetSession);
@@ -334,10 +330,7 @@ async function fetchInitialState() {
       return;
     }
     const data = await res.json();
-    setTopLevelState(
-      { sessionId: data.session_id, currentConfig: data.config },
-      "initial_state"
-    );
+    setTopLevelState({ sessionId: data.session_id, currentConfig: data.config }, "initial_state");
     patchSection("network", { status: NetworkState.OK, lastError: null }, "initial_state");
     patchSection(
       "trigger",
@@ -355,11 +348,7 @@ async function fetchInitialState() {
     }
 
     if (data.current_location) {
-      patchSection(
-        "gps",
-        { coords: data.current_location },
-        "initial_location"
-      );
+      patchSection("gps", { coords: data.current_location }, "initial_location");
     }
 
     if (data.messages && data.messages.length > 0) {
@@ -512,11 +501,7 @@ async function sendPing(audioJustEnded = false) {
       },
       "ping_ok"
     );
-    patchSection(
-      "trigger",
-      { status: data.trigger_status, updatedAt: nowMs },
-      "ping_ok"
-    );
+    patchSection("trigger", { status: data.trigger_status, updatedAt: nowMs }, "ping_ok");
 
     if (data.trigger_status?.should_trigger && !isGenerating() && !isPlayingAudio()) {
       triggerNarration(data.trigger_status.trigger_reason || "auto");
@@ -611,11 +596,7 @@ async function triggerNarration(reason = "manual") {
       );
     }
     patchSection("network", { status: NetworkState.OK, lastError: null }, "narration_ok");
-    patchSection(
-      "trigger",
-      { status: data.trigger_status, updatedAt: Date.now() },
-      "narration_ok"
-    );
+    patchSection("trigger", { status: data.trigger_status, updatedAt: Date.now() }, "narration_ok");
     appendMessageCard(data.message, true);
   } catch (err) {
     patchSection(
@@ -706,11 +687,7 @@ async function sendChat(event) {
       );
     }
     patchSection("network", { status: NetworkState.OK, lastError: null }, "chat_ok");
-    patchSection(
-      "trigger",
-      { status: data.trigger_status, updatedAt: Date.now() },
-      "chat_ok"
-    );
+    patchSection("trigger", { status: data.trigger_status, updatedAt: Date.now() }, "chat_ok");
     appendMessageCard(data.assistant_message, true);
   } catch (err) {
     userCard?.remove();
