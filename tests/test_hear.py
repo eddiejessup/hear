@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import tempfile
 import time
 import unittest
@@ -13,6 +14,7 @@ from pydantic import ValidationError
 from hear.app import app
 from hear.auth import verify_token
 from hear.config import ConfigManager
+from hear.db import HearDB
 from hear.gemini import (
     call_gemini_text,
     call_gemini_tts,
@@ -26,11 +28,35 @@ from hear.geo import (
     haversine_meters,
 )
 from hear.models.config import AppConfig, GeminiConfig, LensConfig, TriggersConfig
-from hear.models.gemini import GeminiContent, GeminiPart
+from hear.models.events import BackendEventType, EventLevel, EventSource
+from hear.models.gemini import GeminiContent, GeminiPart, GeminiTextResult, GroundingSource
 from hear.models.geo import GeoContext
 from hear.models.session import CurrentLocation, TriggerLocation
 from hear.paths import PROJECT_ROOT, resolve_data_dir
 from hear.session import SessionManager, WalkSession, sanitize_client_id
+
+_MODULE_STACK: contextlib.ExitStack | None = None
+_TEST_DB: HearDB | None = None
+
+
+def setUpModule() -> None:
+    global _MODULE_STACK, _TEST_DB
+    stack = contextlib.ExitStack()
+    tmpdir = stack.enter_context(tempfile.TemporaryDirectory())
+    _TEST_DB = HearDB(Path(tmpdir) / "test_module.db")
+    for target in ("hear.db.db", "hear.logging_utils.db", "hear.app.db"):
+        stack.enter_context(patch(target, _TEST_DB))
+    _MODULE_STACK = stack
+
+
+def tearDownModule() -> None:
+    global _MODULE_STACK, _TEST_DB
+    if _TEST_DB is not None:
+        _TEST_DB.close()
+        _TEST_DB = None
+    if _MODULE_STACK is not None:
+        _MODULE_STACK.close()
+        _MODULE_STACK = None
 
 
 class TestGeoHelpers(unittest.TestCase):
@@ -293,42 +319,59 @@ class TestAudioPruningAndAuth(unittest.TestCase):
         self.assertFalse(verify_token("", "secret123"))
 
     def test_api_coordinate_validation_and_duplicate_narrate(self) -> None:
-        client = TestClient(app)
-        with patch("hear.app.get_expected_auth_token", return_value="test-token"):
-            # Unauthorized without token
-            r_unauth = client.get("/api/state")
-            self.assertEqual(r_unauth.status_code, 401)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_db = HearDB(Path(tmpdir) / "hear.db")
+            test_mgr = SessionManager(store=test_db)
+            client = TestClient(app)
+            with (
+                patch("hear.app.get_expected_auth_token", return_value="test-token"),
+                patch("hear.app.db", test_db),
+                patch("hear.logging_utils.db", test_db),
+                patch("hear.app.session_manager", test_mgr),
+            ):
+                # Unauthorized without token
+                r_unauth = client.get("/api/state")
+                self.assertEqual(r_unauth.status_code, 401)
 
-            headers = {"x-hear-token": "test-token", "x-hear-client-id": "testclient"}
-            # Out-of-bounds latitude rejected by Pydantic
-            r_bad_coords = client.post(
-                "/api/ping",
-                json={"lat": 95.0, "lon": 0.0},
-                headers=headers,
-            )
-            self.assertEqual(r_bad_coords.status_code, 422)
-
-            # Duplicate /api/narrate or /api/chat while is_generating is True -> 409 Conflict
-            from hear.app import session_manager
-
-            sess = session_manager.get("testclient")
-            sess.is_generating = True
-            try:
-                r_conflict = client.post(
-                    "/api/narrate",
-                    json={"lat": 51.5142, "lon": -0.0885},
+                headers = {"x-hear-token": "test-token", "x-hear-client-id": "testclient"}
+                # Out-of-bounds latitude rejected by Pydantic
+                r_bad_coords = client.post(
+                    "/api/ping",
+                    json={"lat": 95.0, "lon": 0.0},
                     headers=headers,
                 )
-                self.assertEqual(r_conflict.status_code, 409)
+                self.assertEqual(r_bad_coords.status_code, 422)
 
-                r_chat_conflict = client.post(
-                    "/api/chat",
-                    json={"message": "Tell me more", "lat": 51.5142, "lon": -0.0885},
-                    headers=headers,
-                )
-                self.assertEqual(r_chat_conflict.status_code, 409)
-            finally:
-                sess.is_generating = False
+                # Duplicate /api/narrate or /api/chat while is_generating is True -> 409 Conflict
+                sess = test_mgr.get("testclient")
+                sess.is_generating = True
+                try:
+                    r_conflict = client.post(
+                        "/api/narrate",
+                        json={"lat": 51.5142, "lon": -0.0885},
+                        headers=headers,
+                    )
+                    self.assertEqual(r_conflict.status_code, 409)
+
+                    r_chat_conflict = client.post(
+                        "/api/chat",
+                        json={"message": "Tell me more", "lat": 51.5142, "lon": -0.0885},
+                        headers=headers,
+                    )
+                    self.assertEqual(r_chat_conflict.status_code, 409)
+                finally:
+                    sess.is_generating = False
+
+                # HTTP 4xx errors were persisted to SQLite events
+                events = test_db.get_recent_events(limit=20)
+                error_statuses = [
+                    ev["payload"].get("status_code")
+                    for ev in events
+                    if ev["event_type"] == BackendEventType.HTTP_ERROR
+                ]
+                self.assertIn(401, error_statuses)
+                self.assertIn(409, error_statuses)
+            test_db.close()
 
     def test_empty_gemini_response_raises_502(self) -> None:
         fake_resp = httpx.Response(
@@ -397,6 +440,190 @@ class TestAudioPruningAndAuth(unittest.TestCase):
             self.assertEqual(resolve_data_dir(tmpdir), expected)
             with patch.dict("os.environ", {"HEAR_DATA_DIR": tmpdir}):
                 self.assertEqual(resolve_data_dir(), expected)
+
+
+class TestSQLitePersistenceAndEvents(unittest.TestCase):
+    def test_session_rehydration_client_isolation_and_fts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = HearDB(Path(tmpdir) / "hear.db")
+            cfg = AppConfig(
+                gemini=GeminiConfig(tts_enabled=False),
+                lenses=[
+                    LensConfig(id="econ", name="Economics", enabled=True, prompt="Econ lens"),
+                ],
+            )
+            geo = GeoContext(
+                lat=51.5142,
+                lon=-0.0885,
+                short_label="Cornhill, City of London",
+                full_address="Cornhill, London, UK",
+                road="Cornhill",
+                neighborhood="City of London",
+                city="London",
+                nearby_features=["Royal Exchange"],
+            )
+            fake_narration = GeminiTextResult(
+                text="Cornhill sat at the heart of London's mercantile credit networks.",
+                search_queries=["Cornhill London credit history"],
+                sources=[GroundingSource(title="British History", uri="https://example.com/bh")],
+            )
+            fake_reply = GeminiTextResult(
+                text="The Royal Exchange was founded by Thomas Gresham in 1565.",
+                search_queries=[],
+                sources=[],
+            )
+
+            mgr1 = SessionManager(store=store)
+            elmo = mgr1.get("elmo")
+            with patch(
+                "hear.session.call_gemini_text",
+                new=AsyncMock(side_effect=[fake_narration, fake_reply]),
+            ):
+                asyncio.run(
+                    elmo.execute_narration_turn(
+                        config=cfg,
+                        lat=51.5142,
+                        lon=-0.0885,
+                        heading=90.0,
+                        geo=geo,
+                        reason="manual",
+                    )
+                )
+                asyncio.run(
+                    elmo.execute_chat_turn(
+                        config=cfg,
+                        cleaned_message="Who founded the Royal Exchange?",
+                        lat=51.5142,
+                        lon=-0.0885,
+                        short_label="Cornhill, City of London",
+                    )
+                )
+
+            original_session_id = elmo.session_id
+
+            # Simulate server restart with a brand-new SessionManager backed by the same DB
+            mgr2 = SessionManager(store=store)
+            restored = mgr2.get("elmo")
+            self.assertEqual(restored.session_id, original_session_id)
+            self.assertEqual(len(restored.ui_messages), 3)
+            self.assertEqual(len(restored.gemini_contents), 4)
+            self.assertEqual(restored.used_lens_ids, ["econ"])
+            self.assertIsNotNone(restored.last_trigger_location)
+            assert restored.last_trigger_location is not None
+            self.assertEqual(restored.last_trigger_location.short_label, "Cornhill, City of London")
+
+            # Guest client_id stays completely isolated
+            guest = mgr2.get("guest_abc")
+            self.assertNotEqual(guest.session_id, original_session_id)
+            self.assertEqual(guest.ui_messages, [])
+
+            # FTS5 search finds persisted narrations scoped by client_id
+            hits = store.search_messages("Gresham", client_id="elmo")
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(store.search_messages("Gresham", client_id="guest_abc"), [])
+
+            # Reset marks the previous session inactive so restart starts fresh
+            restored.reset()
+            self.assertNotEqual(restored.session_id, original_session_id)
+            mgr3 = SessionManager(store=store)
+            fresh = mgr3.get("elmo")
+            self.assertEqual(fresh.ui_messages, [])
+
+            store.close()
+
+    def test_location_sample_downsampling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = HearDB(Path(tmpdir) / "hear.db")
+            session = WalkSession("elmo", store=store)
+            now = 1_700_000_000.0
+            loc1 = CurrentLocation(
+                lat=51.5142, lon=-0.0885, short_label="A", full_address="A", timestamp=now
+            )
+            loc_same = CurrentLocation(
+                lat=51.51421, lon=-0.0885, short_label="A", full_address="A", timestamp=now + 6.0
+            )
+            loc_moved = CurrentLocation(
+                lat=51.5145, lon=-0.0885, short_label="B", full_address="B", timestamp=now + 12.0
+            )
+            loc_later = CurrentLocation(
+                lat=51.5145, lon=-0.0885, short_label="B", full_address="B", timestamp=now + 50.0
+            )
+
+            self.assertTrue(asyncio.run(session.record_location_sample_if_needed(loc1)))
+            self.assertFalse(asyncio.run(session.record_location_sample_if_needed(loc_same)))
+            self.assertTrue(asyncio.run(session.record_location_sample_if_needed(loc_moved)))
+            self.assertTrue(asyncio.run(session.record_location_sample_if_needed(loc_later)))
+            store.close()
+
+    def test_config_override_persists_in_sqlite_across_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            store = HearDB(tmp_path / "hear.db")
+            cfg_path = tmp_path / "config.yaml"
+            cfg_path.write_text("system_prompt: From YAML\n", encoding="utf-8")
+
+            mgr1 = ConfigManager(cfg_path, store=store)
+            self.assertEqual(mgr1.get().system_prompt, "From YAML")
+            mgr1.save(AppConfig(system_prompt="Saved via UI"))
+
+            # Simulate fresh container where baked-in config.yaml is older than the DB override
+            import os
+
+            older_ts = time.time() - 3600.0
+            cfg_path.write_text("system_prompt: Baked In Default\n", encoding="utf-8")
+            os.utime(cfg_path, (older_ts, older_ts))
+
+            mgr2 = ConfigManager(cfg_path, store=store)
+            self.assertEqual(mgr2.get().system_prompt, "Saved via UI")
+            store.close()
+
+    def test_client_events_endpoint_and_pruning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = HearDB(Path(tmpdir) / "hear.db")
+            mgr = SessionManager(store=store)
+            client = TestClient(app)
+            with (
+                patch("hear.app.get_expected_auth_token", return_value="test-token"),
+                patch("hear.app.db", store),
+                patch("hear.logging_utils.db", store),
+                patch("hear.app.session_manager", mgr),
+            ):
+                resp = client.post(
+                    "/api/events",
+                    headers={"x-hear-token": "test-token", "x-hear-client-id": "elmo"},
+                    json={
+                        "events": [
+                            {
+                                "level": EventLevel.WARN,
+                                "event_type": "gps_gap",
+                                "payload": {"gap_seconds": 42},
+                            },
+                            {
+                                "level": EventLevel.INFO,
+                                "event_type": "visibility_change",
+                                "payload": {"state": "hidden"},
+                            },
+                        ]
+                    },
+                )
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.json()["accepted"], 2)
+
+            events = store.get_recent_events(client_id="elmo", limit=10)
+            self.assertEqual(len(events), 2)
+            self.assertEqual(events[0]["source"], EventSource.FRONTEND)
+
+            # Insert an expired event and verify pruning removes only the old row
+            store.record_event(
+                source=EventSource.BACKEND,
+                level=EventLevel.INFO,
+                event_type="stale_event",
+                ts=time.time() - 40 * 86400.0,
+            )
+            pruned = store.prune_old_events(max_age_days=30)
+            self.assertEqual(pruned, 1)
+            self.assertEqual(len(store.get_recent_events(limit=10)), 2)
+            store.close()
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -10,12 +11,16 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from hear.auth import get_expected_auth_token, is_unauthenticated_allowed, verify_token
 from hear.config import config_manager
+from hear.db import db
 from hear.debug import get_debug_info
 from hear.gemini import close_gemini_http_client, get_api_key
 from hear.geo import close_geo_http_client, reverse_geocode_and_context
+from hear.logging_utils import configure_logging, log_event, log_event_async
 from hear.models.api import (
     ChatRequest,
     ChatResponse,
+    ClientEventsRequest,
+    ClientEventsResponse,
     NarrateRequest,
     NarrateResponse,
     PingRequest,
@@ -25,23 +30,38 @@ from hear.models.api import (
     UpdateConfigResponse,
 )
 from hear.models.config import AppConfig
+from hear.models.events import BackendEventType, EventLevel, EventSource
 from hear.models.session import CurrentLocation
 from hear.paths import AUDIO_DIR, STATIC_DIR, ensure_dirs
-from hear.session import WalkSession, session_manager
+from hear.session import WalkSession, sanitize_client_id, session_manager
 
 ensure_dirs()
+configure_logging()
+
+
+def _extract_client_id(request: Request) -> str:
+    raw_id = request.headers.get("x-hear-client-id") or request.cookies.get("hear_client_id")
+    return sanitize_client_id(raw_id)
 
 
 def _get_session(request: Request) -> WalkSession:
-    raw_id = request.headers.get("x-hear-client-id") or request.cookies.get("hear_client_id")
-    return session_manager.get(raw_id)
+    return session_manager.get(_extract_client_id(request))
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+    await asyncio.to_thread(db.init)
+    pruned = await asyncio.to_thread(db.prune_old_events, 30)
+    await log_event_async(
+        BackendEventType.SERVER_STARTED,
+        persist=True,
+        pruned_events=pruned,
+        db_path=str(db.path),
+    )
     yield
     await close_geo_http_client()
     await close_gemini_http_client()
+    await asyncio.to_thread(db.close)
 
 
 app = FastAPI(title="Hear — Historical Walking Companion", lifespan=lifespan)
@@ -73,6 +93,57 @@ async def auth_middleware(
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
     return await call_next(request)
+
+
+@app.middleware("http")
+async def request_logging_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    t0 = time.monotonic()
+    path = request.url.path
+    client_id = _extract_client_id(request) if path.startswith("/api/") else None
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        await log_event_async(
+            BackendEventType.HTTP_UNHANDLED_ERROR,
+            level=EventLevel.ERROR,
+            client_id=client_id,
+            method=request.method,
+            path=path,
+            latency_ms=latency_ms,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        raise
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    if path.startswith("/api/"):
+        status = response.status_code
+        # Persist API errors/warnings to SQLite; keep routine 2xx traffic in stdout JSON logs
+        if status >= 400:
+            await log_event_async(
+                BackendEventType.HTTP_ERROR,
+                level=EventLevel.ERROR if status >= 500 else EventLevel.WARN,
+                client_id=client_id,
+                method=request.method,
+                path=path,
+                status_code=status,
+                latency_ms=latency_ms,
+            )
+        elif path != "/api/events":
+            log_event(
+                BackendEventType.HTTP_REQUEST,
+                level=EventLevel.INFO,
+                client_id=client_id,
+                persist=False,
+                method=request.method,
+                path=path,
+                status_code=status,
+                latency_ms=latency_ms,
+            )
+    return response
 
 
 @app.get("/", response_model=None)
@@ -132,8 +203,27 @@ async def ping_location(req: PingRequest, request: Request) -> PingResponse:
         timestamp=time.time(),
     )
     session.current_location = cur_loc
+    await session.record_location_sample_if_needed(cur_loc)
 
     status = session.compute_trigger_status(cfg)
+    if req.audio_just_ended:
+        await log_event_async(
+            BackendEventType.AUDIO_ENDED_PING,
+            session_id=session.session_id,
+            client_id=session.client_id,
+            short_label=cur_loc.short_label,
+        )
+    if status.should_trigger:
+        await log_event_async(
+            BackendEventType.AUTO_TRIGGER_READY,
+            session_id=session.session_id,
+            client_id=session.client_id,
+            reason=status.trigger_reason,
+            distance_moved_m=status.distance_moved_m,
+            silence_elapsed_s=status.silence_elapsed_s,
+            short_label=cur_loc.short_label,
+        )
+
     return PingResponse(
         location=cur_loc,
         trigger_status=status,
@@ -219,6 +309,28 @@ async def steer_chat(req: ChatRequest, request: Request) -> ChatResponse:
         )
 
 
+@app.post("/api/events")
+async def ingest_client_events(req: ClientEventsRequest, request: Request) -> ClientEventsResponse:
+    session = _get_session(request)
+    if not req.events:
+        return ClientEventsResponse(accepted=0)
+
+    items = [
+        {
+            "ts": ev.ts,
+            "source": EventSource.FRONTEND,
+            "level": ev.level,
+            "session_id": ev.session_id or session.session_id,
+            "client_id": session.client_id,
+            "event_type": ev.event_type,
+            "payload": ev.payload,
+        }
+        for ev in req.events
+    ]
+    accepted = await asyncio.to_thread(db.record_events_batch, items)
+    return ClientEventsResponse(accepted=accepted)
+
+
 @app.get("/api/audio/{filename}")
 async def get_audio(filename: str) -> FileResponse:
     safe_name = Path(filename).name
@@ -240,7 +352,15 @@ async def get_config() -> AppConfig:
 @app.put("/api/config")
 async def update_config(new_config: AppConfig, request: Request) -> UpdateConfigResponse:
     session = _get_session(request)
-    saved = config_manager.save(new_config)
+    saved = await asyncio.to_thread(config_manager.save, new_config)
+    await log_event_async(
+        BackendEventType.CONFIG_UPDATED,
+        session_id=session.session_id,
+        client_id=session.client_id,
+        model=saved.gemini.model,
+        auto_trigger_enabled=saved.triggers.auto_trigger_enabled,
+        lens_count=len(saved.lenses),
+    )
     return UpdateConfigResponse(
         config=saved,
         trigger_status=session.compute_trigger_status(saved),
@@ -251,8 +371,15 @@ async def update_config(new_config: AppConfig, request: Request) -> UpdateConfig
 async def reset_session(request: Request) -> ResetSessionResponse:
     session = _get_session(request)
     async with session.lock:
-        session.reset()
+        previous_id = session.session_id
+        await asyncio.to_thread(session.reset)
         cfg = config_manager.get()
+        await log_event_async(
+            BackendEventType.SESSION_RESET,
+            session_id=session.session_id,
+            client_id=session.client_id,
+            previous_session_id=previous_id,
+        )
         return ResetSessionResponse(
             session_id=session.session_id,
             trigger_status=session.compute_trigger_status(cfg),

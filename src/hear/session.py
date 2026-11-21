@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import random
 import re
@@ -5,9 +7,12 @@ import time
 import uuid
 from datetime import UTC, datetime
 
+from hear.db import HearDB, PersistedSessionState, db
 from hear.gemini import call_gemini_text, call_gemini_tts
 from hear.geo import compass_bearing_label, haversine_meters
+from hear.logging_utils import log_event_async
 from hear.models.config import AppConfig, LensConfig
+from hear.models.events import BackendEventType
 from hear.models.gemini import GeminiContent, GeminiPart, GeminiTextResult
 from hear.models.geo import GeoContext
 from hear.models.session import (
@@ -15,18 +20,18 @@ from hear.models.session import (
     CurrentLocation,
     LensSummary,
     MessageLocation,
-    SessionTranscript,
     TriggerLocation,
     TriggerStatus,
     UIMessage,
     UserChatMessage,
 )
-from hear.paths import SESSIONS_DIR
 
 MAX_ACTIVE_SESSIONS = 64
 PAUSE_HOLD_MAX_SECONDS = 180.0
 PAUSE_HOLD_MAX_DISTANCE_METERS = 150.0
 INITIAL_LOCATION_CHAT_GRACE_SECONDS = 15.0
+LOCATION_SAMPLE_MIN_DISTANCE_METERS = 20.0
+LOCATION_SAMPLE_MIN_INTERVAL_SECONDS = 30.0
 _SAFE_CLIENT_ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
 
@@ -38,8 +43,9 @@ def sanitize_client_id(raw_client_id: str | None) -> str:
 
 
 class WalkSession:
-    def __init__(self, client_id: str = "default") -> None:
+    def __init__(self, client_id: str = "default", store: HearDB | None = None) -> None:
         self.client_id: str = sanitize_client_id(client_id)
+        self._store: HearDB | None = store
         self.lock = asyncio.Lock()
         self.session_id: str = ""
         self.started_at: float = 0.0
@@ -56,12 +62,37 @@ class WalkSession:
         self.is_paused_audio: bool = False
         self.paused_at: float | None = None
         self.paused_location: tuple[float, float] | None = None
-        self.reset()
+        self._last_recorded_loc: tuple[float, float, float] | None = None
+        self.reset(persist_deactivate=False)
 
-    def reset(self) -> None:
+    @classmethod
+    def from_persisted(
+        cls, persisted: PersistedSessionState, store: HearDB | None = None
+    ) -> WalkSession:
+        session = cls(client_id=persisted.client_id, store=store)
+        session.session_id = persisted.session_id
+        session.started_at = persisted.started_at
+        session.last_active_at = persisted.last_active_at
+        session.last_trigger_location = persisted.last_trigger_location
+        session.last_trigger_time = persisted.last_trigger_time
+        session.last_audio_ended_at = persisted.last_audio_ended_at
+        session.used_lens_ids = list(persisted.used_lens_ids)
+        session.ui_messages = list(persisted.ui_messages)
+        session.gemini_contents = list(persisted.gemini_contents)
+        return session
+
+    def reset(self, *, persist_deactivate: bool = True) -> None:
+        previous_id = self.session_id
+        if persist_deactivate and previous_id and self._store is not None:
+            self._store.mark_session_inactive(previous_id)
+
         ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         suffix = self.client_id[:8]
-        self.session_id = f"{ts}_{suffix}" if suffix != "default" else ts
+        # Include a short random tag when resetting within the same second to guarantee uniqueness
+        candidate_id = f"{ts}_{suffix}" if suffix != "default" else ts
+        if candidate_id == previous_id:
+            candidate_id = f"{candidate_id}_{uuid.uuid4().hex[:4]}"
+        self.session_id = candidate_id
         self.started_at = time.time()
         self.last_active_at = self.started_at
         self.gemini_contents = []
@@ -76,6 +107,36 @@ class WalkSession:
         self.is_paused_audio = False
         self.paused_at = None
         self.paused_location = None
+        self._last_recorded_loc = None
+
+    def should_record_location_sample(self, lat: float, lon: float, now: float) -> bool:
+        if self._last_recorded_loc is None:
+            return True
+        prev_lat, prev_lon, prev_ts = self._last_recorded_loc
+        if (now - prev_ts) >= LOCATION_SAMPLE_MIN_INTERVAL_SECONDS:
+            return True
+        return haversine_meters(prev_lat, prev_lon, lat, lon) >= LOCATION_SAMPLE_MIN_DISTANCE_METERS
+
+    async def record_location_sample_if_needed(self, loc: CurrentLocation) -> bool:
+        if self._store is None:
+            return False
+        if not self.should_record_location_sample(loc.lat, loc.lon, loc.timestamp):
+            return False
+        self._last_recorded_loc = (loc.lat, loc.lon, loc.timestamp)
+        await asyncio.to_thread(
+            self._store.record_location_sample,
+            session_id=self.session_id,
+            client_id=self.client_id,
+            started_at=self.started_at,
+            ts=loc.timestamp,
+            lat=loc.lat,
+            lon=loc.lon,
+            accuracy=loc.accuracy,
+            heading=loc.heading,
+            speed=loc.speed,
+            short_label=loc.short_label,
+        )
+        return True
 
     def update_audio_state(
         self,
@@ -138,12 +199,13 @@ class WalkSession:
         self,
         config: AppConfig,
         user_prompt_text: str,
-    ) -> tuple[GeminiTextResult, str | None, float]:
+    ) -> tuple[GeminiTextResult, str | None, float, int, int | None]:
         """Run a Gemini text + optional TTS turn and append it to session history."""
         gemini_cfg = config.gemini
         user_turn = GeminiContent(role="user", parts=[GeminiPart(text=user_prompt_text)])
         trial_contents: list[GeminiContent] = [*self.gemini_contents, user_turn]
 
+        t_llm = time.monotonic()
         llm_result = await call_gemini_text(
             contents=trial_contents,
             system_prompt=config.system_prompt,
@@ -151,27 +213,32 @@ class WalkSession:
             temperature=gemini_cfg.temperature,
             enable_google_search=gemini_cfg.enable_google_search,
         )
+        llm_latency_ms = int((time.monotonic() - t_llm) * 1000)
 
         audio_url: str | None = None
+        tts_latency_ms: int | None = None
         if gemini_cfg.tts_enabled:
+            t_tts = time.monotonic()
             audio_url = await call_gemini_tts(
                 text=llm_result.text,
                 tts_model=gemini_cfg.tts_model,
                 voice_name=gemini_cfg.tts_voice,
                 style_prompt=gemini_cfg.tts_style_prompt,
             )
+            tts_latency_ms = int((time.monotonic() - t_tts) * 1000)
 
         now = time.time()
         model_turn = GeminiContent(role="model", parts=[GeminiPart(text=llm_result.text)])
         self.gemini_contents = [*trial_contents, model_turn]
         self.last_trigger_time = now
+        self.last_active_at = now
         self.is_paused_audio = False
         self.paused_at = None
         self.paused_location = None
         if audio_url is None:
             self.last_audio_ended_at = now
 
-        return llm_result, audio_url, now
+        return llm_result, audio_url, now, llm_latency_ms, tts_latency_ms
 
     def sample_lens(self, config: AppConfig, requested_lens_id: str | None = None) -> LensConfig:
         all_lenses = config.lenses
@@ -350,7 +417,9 @@ class WalkSession:
             lens=lens,
             custom_focus=custom_focus,
         )
-        llm_result, audio_url, now = await self.run_gemini_turn(config, location_prompt)
+        llm_result, audio_url, now, llm_latency_ms, tts_latency_ms = await self.run_gemini_turn(
+            config, location_prompt
+        )
 
         self.last_trigger_location = TriggerLocation(
             lat=lat,
@@ -378,7 +447,42 @@ class WalkSession:
             search_queries=llm_result.search_queries,
         )
         self.ui_messages.append(msg_record)
-        await asyncio.to_thread(self.persist_transcript)
+        if self._store is not None:
+            await asyncio.to_thread(
+                self._store.save_narration_turn,
+                session_id=self.session_id,
+                client_id=self.client_id,
+                started_at=self.started_at,
+                last_active_at=now,
+                last_trigger_location=self.last_trigger_location,
+                last_trigger_time=self.last_trigger_time,
+                last_audio_ended_at=self.last_audio_ended_at,
+                used_lens_ids=self.used_lens_ids,
+                message=msg_record,
+                prompt_text=location_prompt,
+                llm_latency_ms=llm_latency_ms,
+                tts_latency_ms=tts_latency_ms,
+            )
+        await log_event_async(
+            BackendEventType.NARRATION_COMPLETED,
+            session_id=self.session_id,
+            client_id=self.client_id,
+            target_db=self._store,
+            persist=self._store is not None,
+            message_id=msg_record.id,
+            reason=reason,
+            lens_id=lens.id,
+            model=config.gemini.model,
+            short_label=geo.short_label,
+            lat=round(lat, 5),
+            lon=round(lon, 5),
+            word_count=len(llm_result.text.split()),
+            has_audio=audio_url is not None,
+            source_count=len(llm_result.sources),
+            search_query_count=len(llm_result.search_queries),
+            llm_latency_ms=llm_latency_ms,
+            tts_latency_ms=tts_latency_ms,
+        )
         return msg_record
 
     async def execute_chat_turn(
@@ -401,7 +505,9 @@ class WalkSession:
             text=cleaned_message,
         )
         user_prompt_text = f"{loc_prefix}User message: {cleaned_message}"
-        llm_result, audio_url, now = await self.run_gemini_turn(config, user_prompt_text)
+        llm_result, audio_url, now, llm_latency_ms, tts_latency_ms = await self.run_gemini_turn(
+            config, user_prompt_text
+        )
 
         assistant_msg_ui = AssistantMessage(
             id=uuid.uuid4().hex[:10],
@@ -420,25 +526,51 @@ class WalkSession:
         )
         self.ui_messages.append(user_msg_ui)
         self.ui_messages.append(assistant_msg_ui)
-        await asyncio.to_thread(self.persist_transcript)
-        return user_msg_ui, assistant_msg_ui
-
-    def persist_transcript(self) -> None:
-        out_file = SESSIONS_DIR / f"session_{self.session_id}.json"
-        transcript = SessionTranscript(
+        if self._store is not None:
+            await asyncio.to_thread(
+                self._store.save_chat_turn,
+                session_id=self.session_id,
+                client_id=self.client_id,
+                started_at=self.started_at,
+                last_active_at=now,
+                last_trigger_location=self.last_trigger_location,
+                last_trigger_time=self.last_trigger_time,
+                last_audio_ended_at=self.last_audio_ended_at,
+                used_lens_ids=self.used_lens_ids,
+                user_message=user_msg_ui,
+                assistant_message=assistant_msg_ui,
+                prompt_text=user_prompt_text,
+                lat=lat,
+                lon=lon,
+                llm_latency_ms=llm_latency_ms,
+                tts_latency_ms=tts_latency_ms,
+            )
+        await log_event_async(
+            BackendEventType.CHAT_COMPLETED,
             session_id=self.session_id,
-            started_at=self.started_at,
-            messages=self.ui_messages,
+            client_id=self.client_id,
+            target_db=self._store,
+            persist=self._store is not None,
+            message_id=assistant_msg_ui.id,
+            model=config.gemini.model,
+            short_label=short_label,
+            word_count=len(llm_result.text.split()),
+            has_audio=audio_url is not None,
+            llm_latency_ms=llm_latency_ms,
+            tts_latency_ms=tts_latency_ms,
         )
-        out_file.write_text(transcript.model_dump_json(indent=2), encoding="utf-8")
+        return user_msg_ui, assistant_msg_ui
 
 
 class SessionManager:
-    """Manages isolated WalkSession instances per client_id."""
+    """Manages isolated WalkSession instances per client_id, backed by SQLite."""
 
-    def __init__(self, max_sessions: int = MAX_ACTIVE_SESSIONS) -> None:
+    def __init__(
+        self, max_sessions: int = MAX_ACTIVE_SESSIONS, store: HearDB | None = None
+    ) -> None:
         self._sessions: dict[str, WalkSession] = {}
         self._max_sessions = max_sessions
+        self._store = store
 
     def get(self, raw_client_id: str | None) -> WalkSession:
         client_id = sanitize_client_id(raw_client_id)
@@ -450,10 +582,19 @@ class SessionManager:
                     key=lambda k: self._sessions[k].last_active_at,
                 )
                 self._sessions.pop(oldest_key, None)
-            walk_session = WalkSession(client_id=client_id)
+
+            persisted = (
+                self._store.load_latest_active_session(client_id)
+                if self._store is not None
+                else None
+            )
+            if persisted is not None:
+                walk_session = WalkSession.from_persisted(persisted, store=self._store)
+            else:
+                walk_session = WalkSession(client_id=client_id, store=self._store)
             self._sessions[client_id] = walk_session
         walk_session.last_active_at = time.time()
         return walk_session
 
 
-session_manager = SessionManager()
+session_manager = SessionManager(store=db)

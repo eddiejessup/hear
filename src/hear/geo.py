@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from hear.logging_utils import log_event_async
+from hear.models.events import BackendEventType, EventLevel
 from hear.models.geo import GeoContext
 
 _USER_AGENT = "HearWalkingCompanion/0.1 (personal-history-agent)"
@@ -140,6 +142,7 @@ async def _fetch_nominatim(
     if time.time() < _nominatim_backoff_until:
         return short_label, full_address, road, neighborhood, city, False
 
+    t0 = time.monotonic()
     try:
         resp = await client.get(
             "https://nominatim.openstreetmap.org/reverse",
@@ -152,6 +155,7 @@ async def _fetch_nominatim(
             },
             timeout=6.0,
         )
+        latency_ms = int((time.monotonic() - t0) * 1000)
         if resp.status_code == 200:
             data = resp.json()
             ok = True
@@ -192,8 +196,33 @@ async def _fetch_nominatim(
                 parts.append(city)
             if parts:
                 short_label = ", ".join(parts)
-    except httpx.HTTPError, ValueError:
-        pass
+            await log_event_async(
+                BackendEventType.GEO_NOMINATIM_OK,
+                level=EventLevel.DEBUG,
+                persist=False,
+                latency_ms=latency_ms,
+                short_label=short_label,
+            )
+        else:
+            await log_event_async(
+                BackendEventType.GEO_NOMINATIM_ERROR,
+                level=EventLevel.WARN,
+                status_code=resp.status_code,
+                latency_ms=latency_ms,
+                lat=round(lat, 5),
+                lon=round(lon, 5),
+            )
+    except (httpx.HTTPError, ValueError) as exc:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        await log_event_async(
+            BackendEventType.GEO_NOMINATIM_ERROR,
+            level=EventLevel.WARN,
+            error=str(exc),
+            error_type=type(exc).__name__,
+            latency_ms=latency_ms,
+            lat=round(lat, 5),
+            lon=round(lon, 5),
+        )
 
     if not ok:
         _nominatim_backoff_until = time.time() + _NOMINATIM_FAILURE_BACKOFF_SECONDS
@@ -220,12 +249,14 @@ async def _fetch_overpass(
     """
     nearby_features: list[str] = []
     ok = False
+    t0 = time.monotonic()
     try:
         ov_resp = await client.post(
             "https://overpass-api.de/api/interpreter",
             data={"data": overpass_query},
             timeout=4.5,
         )
+        latency_ms = int((time.monotonic() - t0) * 1000)
         if ov_resp.status_code == 200:
             elements = ov_resp.json().get("elements", [])
             ok = True
@@ -253,8 +284,33 @@ async def _fetch_overpass(
                     extra.append(f"wiki: {tags['wikipedia']}")
                 suffix = f" ({kind}{', ' + ', '.join(extra) if extra else ''})"
                 nearby_features.append(f"{name}{suffix}")
-    except httpx.HTTPError, ValueError:
-        pass
+            await log_event_async(
+                BackendEventType.GEO_OVERPASS_OK,
+                level=EventLevel.DEBUG,
+                persist=False,
+                latency_ms=latency_ms,
+                feature_count=len(nearby_features),
+            )
+        else:
+            await log_event_async(
+                BackendEventType.GEO_OVERPASS_ERROR,
+                level=EventLevel.WARN,
+                status_code=ov_resp.status_code,
+                latency_ms=latency_ms,
+                lat=round(lat, 5),
+                lon=round(lon, 5),
+            )
+    except (httpx.HTTPError, ValueError) as exc:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        await log_event_async(
+            BackendEventType.GEO_OVERPASS_ERROR,
+            level=EventLevel.WARN,
+            error=str(exc),
+            error_type=type(exc).__name__,
+            latency_ms=latency_ms,
+            lat=round(lat, 5),
+            lon=round(lon, 5),
+        )
     return nearby_features[:10], ok
 
 

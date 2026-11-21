@@ -1,7 +1,10 @@
+from typing import Any
+
 from pydantic import Field
 
 from hear.models.common import HearModel
 from hear.models.config import AppConfig
+from hear.models.events import EventLevel
 from hear.models.session import (
     AssistantMessage,
     CurrentLocation,
@@ -75,3 +78,19 @@ class UpdateConfigResponse(HearModel):
 class ResetSessionResponse(HearModel):
     session_id: str
     trigger_status: TriggerStatus
+
+
+class ClientEventInput(HearModel):
+    ts: float | None = None
+    level: EventLevel = EventLevel.INFO
+    session_id: str | None = Field(default=None, max_length=128)
+    event_type: str = Field(min_length=1, max_length=64)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ClientEventsRequest(HearModel):
+    events: list[ClientEventInput] = Field(default_factory=list, max_length=100)
+
+
+class ClientEventsResponse(HearModel):
+    accepted: int
