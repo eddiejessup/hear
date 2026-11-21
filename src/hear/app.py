@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -41,8 +42,10 @@ from hear.models.api import (
 from hear.models.config import AppConfig
 from hear.models.events import BackendEventType, EventLevel, EventSource
 from hear.models.session import CurrentLocation
-from hear.paths import AppPaths
+from hear.paths import PROJECT_ROOT, AppPaths
 from hear.session import SessionManager, WalkSession, sanitize_client_id
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -65,7 +68,7 @@ def build_container(
     *,
     paths: AppPaths | None = None,
     data_dir: Path | str | None = None,
-    config_path: Path | None = None,
+    config_path: Path | str | None = None,
     env: EnvReader | None = None,
     auth_token: str | None = None,
     allow_unauthenticated: bool | None = None,
@@ -73,9 +76,17 @@ def build_container(
     geo: GeoService | None = None,
     gemini: GeminiClient | None = None,
 ) -> AppContainer:
-    resolved_paths = paths or AppPaths.from_env(data_dir=data_dir, config_path=config_path)
+    if paths is not None:
+        resolved_paths = paths
+        resolved_env = env if env is not None else EnvReader(dotenv_path=resolved_paths.dotenv_path)
+    else:
+        resolved_env = env if env is not None else EnvReader(dotenv_path=PROJECT_ROOT / ".env")
+        resolved_paths = AppPaths.from_env(
+            data_dir=data_dir,
+            config_path=config_path,
+            env=resolved_env,
+        )
     resolved_paths.ensure_dirs()
-    resolved_env = env or EnvReader(dotenv_path=resolved_paths.dotenv_path)
     auth = AuthSettings(
         resolved_env,
         auth_token=auth_token,
@@ -120,8 +131,10 @@ def _extract_client_id(request: Request) -> str:
 def create_app(
     *,
     container: AppContainer | None = None,
+    paths: AppPaths | None = None,
     data_dir: Path | str | None = None,
-    config_path: Path | None = None,
+    config_path: Path | str | None = None,
+    env: EnvReader | None = None,
     auth_token: str | None = None,
     allow_unauthenticated: bool | None = None,
     gemini_api_key: str | None = None,
@@ -131,8 +144,10 @@ def create_app(
         configure_logging()
 
     c = container or build_container(
+        paths=paths,
         data_dir=data_dir,
         config_path=config_path,
+        env=env,
         auth_token=auth_token,
         allow_unauthenticated=allow_unauthenticated,
         gemini_api_key=gemini_api_key,
@@ -149,10 +164,21 @@ def create_app(
             pruned_events=pruned,
             db_path=str(c.db.path),
         )
-        yield
-        await c.geo.close()
-        await c.gemini.close()
-        await asyncio.to_thread(c.db.close)
+        try:
+            yield
+        finally:
+            try:
+                await c.geo.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to close GeoService during shutdown: %s", exc)
+            try:
+                await c.gemini.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to close GeminiClient during shutdown: %s", exc)
+            try:
+                await asyncio.to_thread(c.db.close)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to close HearDB during shutdown: %s", exc)
 
     app = FastAPI(title="Hear — Historical Walking Companion", lifespan=lifespan)
     app.state.container = c

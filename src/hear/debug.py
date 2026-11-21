@@ -32,20 +32,15 @@ def _detect_git_value(args: list[str], env_key: str, *, env: EnvReader, cwd: Pat
 
 
 class RuntimeDebugProvider:
-    """Collects build/runtime metadata once per app instance (no import-time side effects)."""
+    """Collects build/runtime metadata lazily per app instance (no import-time side effects)."""
 
     def __init__(self, paths: AppPaths, env: EnvReader) -> None:
+        self._paths = paths
+        self._env = env
         self._started_epoch = time.time()
         self._started_at_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        self._git_commit = _detect_git_value(
-            ["rev-parse", "--short", "HEAD"], "HEAR_GIT_COMMIT", env=env, cwd=paths.project_root
-        )
-        self._git_commit_time = _detect_git_value(
-            ["show", "-s", "--format=%cI", "HEAD"],
-            "HEAR_GIT_COMMIT_TIME",
-            env=env,
-            cwd=paths.project_root,
-        )
+        self._git_commit: str | None = None
+        self._git_commit_time: str | None = None
         self._build_time = env.get("HEAR_BUILD_TIME") or "local-dev"
         self._cloud_run_revision = env.get("K_REVISION") or "local"
         self._cloud_run_service = env.get("K_SERVICE") or "local"
@@ -53,10 +48,28 @@ class RuntimeDebugProvider:
         self._data_dir = str(paths.data_dir)
         self._litestream_enabled = bool(env.get("HEAR_LITESTREAM_BUCKET"))
 
+    def _ensure_git_metadata(self) -> tuple[str, str]:
+        if self._git_commit is None:
+            self._git_commit = _detect_git_value(
+                ["rev-parse", "--short", "HEAD"],
+                "HEAR_GIT_COMMIT",
+                env=self._env,
+                cwd=self._paths.project_root,
+            )
+        if self._git_commit_time is None:
+            self._git_commit_time = _detect_git_value(
+                ["show", "-s", "--format=%cI", "HEAD"],
+                "HEAR_GIT_COMMIT_TIME",
+                env=self._env,
+                cwd=self._paths.project_root,
+            )
+        return self._git_commit, self._git_commit_time
+
     def get_info(self) -> DebugInfo:
+        git_commit, git_commit_time = self._ensure_git_metadata()
         return DebugInfo(
-            git_commit=self._git_commit,
-            git_commit_time=self._git_commit_time,
+            git_commit=git_commit,
+            git_commit_time=git_commit_time,
             build_time=self._build_time,
             cloud_run_revision=self._cloud_run_revision,
             cloud_run_service=self._cloud_run_service,

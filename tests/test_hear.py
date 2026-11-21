@@ -13,10 +13,11 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from hear.app import create_app
+from hear.app import build_container, create_app
 from hear.auth import AuthSettings, EnvReader, verify_token
 from hear.config import ConfigManager
 from hear.db import HearDB
+from hear.debug import RuntimeDebugProvider
 from hear.gemini import GeminiClient, pcm_to_wav_bytes, prune_old_audio_files
 from hear.geo import GeoCache, GeoService, compass_bearing_label, haversine_meters
 from hear.logging_utils import EventLogger, bind_event_context, set_event_session_id
@@ -113,7 +114,6 @@ class TestGeoHelpers(unittest.TestCase):
 
     def test_nominatim_failure_backoff(self) -> None:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
-        mock_client.is_closed = False
         mock_client.get.side_effect = httpx.ConnectError("Connection refused")
         geo = GeoService(http_client=mock_client)
 
@@ -320,8 +320,11 @@ class TestAudioPruningAndAuth(unittest.TestCase):
 
     def test_api_coordinate_validation_and_duplicate_narrate(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
             test_app = create_app(
-                data_dir=Path(tmpdir),
+                data_dir=tmp_path,
+                config_path=tmp_path / "config.yaml",
+                env=EnvReader(environ={}),
                 auth_token="test-token",
                 configure_logs=False,
             )
@@ -373,8 +376,11 @@ class TestAudioPruningAndAuth(unittest.TestCase):
 
     def test_static_frontend_modules_served(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
             test_app = create_app(
-                data_dir=Path(tmpdir),
+                data_dir=tmp_path,
+                config_path=tmp_path / "config.yaml",
+                env=EnvReader(environ={}),
                 auth_token="test-token",
                 configure_logs=False,
             )
@@ -401,7 +407,6 @@ class TestAudioPruningAndAuth(unittest.TestCase):
             json={"candidates": [{"finishReason": "SAFETY", "content": {"parts": []}}]},
         )
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.is_closed = False
         mock_http.post.return_value = fake_resp
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -432,7 +437,6 @@ class TestAudioPruningAndAuth(unittest.TestCase):
             },
         )
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.is_closed = False
         mock_http.post.side_effect = [bad_json_resp, bad_b64_resp]
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -610,8 +614,11 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
 
     def test_client_events_endpoint_and_pruning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
             test_app = create_app(
-                data_dir=Path(tmpdir),
+                data_dir=tmp_path,
+                config_path=tmp_path / "config.yaml",
+                env=EnvReader(environ={}),
                 auth_token="test-token",
                 configure_logs=False,
             )
@@ -743,7 +750,6 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
             store.init()
             ev_logger = EventLogger(store=store)
             mock_http = AsyncMock(spec=httpx.AsyncClient)
-            mock_http.is_closed = False
             mock_http.post.return_value = httpx.Response(200, content=b"not-json")
             gemini = GeminiClient(
                 audio_dir=Path(tmpdir),
@@ -824,6 +830,113 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
                 mgr.save(AppConfig(system_prompt="SQLite prompt"))
             self.assertEqual(mgr.get().system_prompt, "SQLite prompt")
             store.close()
+
+    def test_app_paths_empty_data_dir_env_reader_and_ensure_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir).resolve()
+            env_data = root / "from_env_reader"
+            missing_static = root / "nonexistent_static"
+
+            paths_empty = AppPaths.from_env(
+                data_dir="",
+                config_path=str(root / "custom.yaml"),
+                project_root=root,
+                static_dir=missing_static,
+            )
+            self.assertEqual(paths_empty.data_dir, root / "data")
+            self.assertEqual(paths_empty.config_path, root / "custom.yaml")
+            paths_empty.ensure_dirs()
+            self.assertTrue(paths_empty.data_dir.is_dir())
+            self.assertTrue(paths_empty.audio_dir.is_dir())
+            self.assertFalse(missing_static.exists())
+
+            paths_from_env = AppPaths.from_env(
+                project_root=root,
+                env=EnvReader(environ={"HEAR_DATA_DIR": str(env_data)}),
+            )
+            self.assertEqual(paths_from_env.data_dir, env_data)
+
+    def test_create_app_isolated_config_and_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir).resolve()
+            cfg_path = tmp_path / "isolated_config.yaml"
+            with patch.dict("os.environ", {"HEAR_AUTH_TOKEN": "host-secret"}):
+                test_app = create_app(
+                    data_dir=tmp_path,
+                    config_path=cfg_path,
+                    env=EnvReader(environ={}),
+                    allow_unauthenticated=True,
+                    configure_logs=False,
+                )
+                with TestClient(test_app) as client:
+                    state_resp = client.get("/api/state")
+                    self.assertEqual(state_resp.status_code, 200)
+                    self.assertFalse(state_resp.json()["has_api_key"])
+
+                    put_resp = client.put(
+                        "/api/config",
+                        json=AppConfig(system_prompt="Isolated prompt").model_dump(),
+                    )
+                    self.assertEqual(put_resp.status_code, 200)
+                    self.assertTrue(cfg_path.exists())
+                    self.assertIn("Isolated prompt", cfg_path.read_text(encoding="utf-8"))
+
+    def test_injected_http_client_not_replaced_or_closed(self) -> None:
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.is_closed = True
+
+        geo = GeoService(http_client=mock_http)
+        self.assertIs(geo._get_client(), mock_http)
+        asyncio.run(geo.close())
+        mock_http.aclose.assert_not_awaited()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gemini = GeminiClient(audio_dir=Path(tmpdir), api_key="k", http_client=mock_http)
+            self.assertIs(gemini._get_client(), mock_http)
+            asyncio.run(gemini.close())
+            mock_http.aclose.assert_not_awaited()
+
+    def test_lifespan_shutdown_closes_db_even_if_geo_close_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            container = build_container(
+                data_dir=tmp_path,
+                config_path=tmp_path / "config.yaml",
+                env=EnvReader(environ={}),
+                allow_unauthenticated=True,
+            )
+            geo_close = AsyncMock(side_effect=RuntimeError("geo shutdown boom"))
+            gemini_close = AsyncMock()
+            with (
+                patch.object(container.geo, "close", geo_close),
+                patch.object(container.gemini, "close", gemini_close),
+            ):
+                test_app = create_app(container=container, configure_logs=False)
+                with TestClient(test_app) as client:
+                    self.assertEqual(client.get("/api/config").status_code, 200)
+                    self.assertIsNotNone(container.db._conn)
+                geo_close.assert_awaited_once()
+                gemini_close.assert_awaited_once()
+                self.assertIsNone(container.db._conn)
+
+    def test_runtime_debug_provider_resolves_git_lazily(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = AppPaths.from_env(data_dir=tmpdir, project_root=Path(tmpdir))
+            env = EnvReader(environ={})
+            with patch("hear.debug.subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                mock_run.return_value.stdout = "abc1234\n"
+                provider = RuntimeDebugProvider(paths, env)
+                self.assertEqual(mock_run.call_count, 0)
+
+                info1 = provider.get_info()
+                self.assertEqual(info1.git_commit, "abc1234")
+                self.assertEqual(mock_run.call_count, 2)
+
+                # Subsequent calls reuse cached git metadata
+                info2 = provider.get_info()
+                self.assertEqual(info2.git_commit, "abc1234")
+                self.assertEqual(mock_run.call_count, 2)
 
 
 if __name__ == "__main__":

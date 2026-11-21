@@ -80,6 +80,8 @@ class GeminiClient:
         self._owns_client = http_client is None
 
     def _get_client(self) -> httpx.AsyncClient:
+        if not self._owns_client and self._http_client is not None:
+            return self._http_client
         if self._http_client is None or self._http_client.is_closed:
             self._http_client = httpx.AsyncClient(timeout=90.0)
             self._owns_client = True
