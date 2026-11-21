@@ -150,11 +150,6 @@ async def trigger_narration(req: NarrateRequest, request: Request) -> NarrateRes
         )
 
     async with session.lock:
-        if session.is_generating:
-            raise HTTPException(
-                status_code=409,
-                detail="Narration or response generation is already in progress.",
-            )
         cfg = config_manager.get()
         lat, lon, heading = session.resolve_coords(req.lat, req.lon, req.heading)
 
@@ -174,13 +169,13 @@ async def trigger_narration(req: NarrateRequest, request: Request) -> NarrateRes
                 custom_focus=req.custom_focus,
                 reason=req.reason,
             )
-
-            return NarrateResponse(
-                message=msg_record,
-                trigger_status=session.compute_trigger_status(cfg),
-            )
         finally:
             session.is_generating = False
+
+        return NarrateResponse(
+            message=msg_record,
+            trigger_status=session.compute_trigger_status(cfg),
+        )
 
 
 @app.post("/api/chat")
@@ -197,11 +192,6 @@ async def steer_chat(req: ChatRequest, request: Request) -> ChatResponse:
         )
 
     async with session.lock:
-        if session.is_generating:
-            raise HTTPException(
-                status_code=409,
-                detail="Narration or response generation is already in progress.",
-            )
         cfg = config_manager.get()
         lat, lon, _ = session.resolve_coords(req.lat, req.lon)
 
@@ -219,14 +209,14 @@ async def steer_chat(req: ChatRequest, request: Request) -> ChatResponse:
                 lon=lon,
                 short_label=short_label,
             )
-
-            return ChatResponse(
-                user_message=user_msg_ui,
-                assistant_message=assistant_msg_ui,
-                trigger_status=session.compute_trigger_status(cfg),
-            )
         finally:
             session.is_generating = False
+
+        return ChatResponse(
+            user_message=user_msg_ui,
+            assistant_message=assistant_msg_ui,
+            trigger_status=session.compute_trigger_status(cfg),
+        )
 
 
 @app.get("/api/audio/{filename}")

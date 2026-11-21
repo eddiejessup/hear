@@ -13,7 +13,12 @@ from pydantic import ValidationError
 from hear.app import app
 from hear.auth import verify_token
 from hear.config import ConfigManager
-from hear.gemini import call_gemini_text, pcm_to_wav_bytes, prune_old_audio_files
+from hear.gemini import (
+    call_gemini_text,
+    call_gemini_tts,
+    pcm_to_wav_bytes,
+    prune_old_audio_files,
+)
 from hear.geo import (
     GeoCache,
     _fetch_nominatim,
@@ -24,6 +29,7 @@ from hear.models.config import AppConfig, GeminiConfig, LensConfig, TriggersConf
 from hear.models.gemini import GeminiContent, GeminiPart
 from hear.models.geo import GeoContext
 from hear.models.session import CurrentLocation, TriggerLocation
+from hear.paths import PROJECT_ROOT, resolve_data_dir
 from hear.session import SessionManager, WalkSession, sanitize_client_id
 
 
@@ -57,10 +63,11 @@ class TestGeoHelpers(unittest.TestCase):
         )
         cache.set(51.5142, -0.0885, base_ctx, has_overpass=False)
 
-        # Within 25m without requiring overpass -> cache hit
-        self.assertIsNotNone(cache.get_if_close(51.51425, -0.0885, require_overpass=False))
-        # Requiring overpass when entry doesn't have it -> cache miss
-        self.assertIsNone(cache.get_if_close(51.51425, -0.0885, require_overpass=True))
+        # Within 25m without overpass -> cache hit with has_overpass=False
+        entry = cache.find_close_entry(51.51425, -0.0885)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertFalse(entry.has_overpass)
 
         # Upgrade with overpass features preserves original geocoded anchor coordinates
         upgraded_ctx = base_ctx.model_copy(update={"nearby_features": ["Royal Exchange"]})
@@ -68,19 +75,20 @@ class TestGeoHelpers(unittest.TestCase):
         entry = cache.find_close_entry(51.5142, -0.0885)
         self.assertIsNotNone(entry)
         assert entry is not None
+        self.assertTrue(entry.has_overpass)
         self.assertAlmostEqual(entry.lat, 51.5142)
         self.assertEqual(entry.result.nearby_features, ["Royal Exchange"])
 
         # Add a second entry far away, then touch the first entry so it becomes MRU
         other_ctx = base_ctx.model_copy(update={"lat": 51.5200, "short_label": "Moorgate"})
         cache.set(51.5200, -0.0885, other_ctx, has_overpass=True)
-        self.assertIsNotNone(cache.get_if_close(51.5142, -0.0885, require_overpass=True))
+        self.assertIsNotNone(cache.find_close_entry(51.5142, -0.0885))
 
         # Adding a third entry evicts the LRU (51.5200) and keeps the MRU (51.5142)
         third_ctx = base_ctx.model_copy(update={"lat": 51.5300, "short_label": "Angel"})
         cache.set(51.5300, -0.0885, third_ctx, has_overpass=True)
-        self.assertIsNotNone(cache.get_if_close(51.5142, -0.0885, require_overpass=True))
-        self.assertIsNone(cache.get_if_close(51.5200, -0.0885, require_overpass=True))
+        self.assertIsNotNone(cache.find_close_entry(51.5142, -0.0885))
+        self.assertIsNone(cache.find_close_entry(51.5200, -0.0885))
 
     def test_nominatim_failure_backoff(self) -> None:
         mock_client = AsyncMock()
@@ -342,6 +350,26 @@ class TestAudioPruningAndAuth(unittest.TestCase):
             self.assertEqual(ctx.exception.status_code, 502)
             self.assertIn("SAFETY", str(ctx.exception.detail))
 
+    def test_tts_malformed_response_degrades_to_none(self) -> None:
+        bad_json_resp = httpx.Response(200, content=b"not-json")
+        bad_b64_resp = httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {"content": {"parts": [{"inlineData": {"data": "!!!not-base64!!!"}}]}}
+                ]
+            },
+        )
+        with (
+            patch("hear.gemini.get_api_key", return_value="fake-key"),
+            patch(
+                "hear.gemini._post_gemini_with_retry",
+                new=AsyncMock(side_effect=[bad_json_resp, bad_b64_resp]),
+            ),
+        ):
+            self.assertIsNone(asyncio.run(call_gemini_tts("Hello")))
+            self.assertIsNone(asyncio.run(call_gemini_tts("Hello")))
+
     def test_config_manager_atomic_save_and_corrupt_yaml_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg_path = Path(tmpdir) / "config.yaml"
@@ -360,6 +388,15 @@ class TestAudioPruningAndAuth(unittest.TestCase):
     def test_gemini_config_model_id_validation(self) -> None:
         with self.assertRaises(ValidationError):
             GeminiConfig(model="../bad/model")
+
+    def test_resolve_data_dir_default_and_override(self) -> None:
+        with patch.dict("os.environ", {}, clear=False):
+            self.assertEqual(resolve_data_dir(""), PROJECT_ROOT / "data")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            expected = Path(tmpdir).resolve()
+            self.assertEqual(resolve_data_dir(tmpdir), expected)
+            with patch.dict("os.environ", {"HEAR_DATA_DIR": tmpdir}):
+                self.assertEqual(resolve_data_dir(), expected)
 
 
 if __name__ == "__main__":

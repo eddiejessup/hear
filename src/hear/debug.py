@@ -5,7 +5,7 @@ import time
 from datetime import UTC, datetime
 
 from hear.models.session import DebugInfo
-from hear.paths import PROJECT_ROOT
+from hear.paths import DATA_DIR, PROJECT_ROOT
 
 SERVER_START_EPOCH = time.time()
 SERVER_STARTED_AT_ISO = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -37,6 +37,7 @@ BUILD_TIME = os.environ.get("HEAR_BUILD_TIME", "").strip() or "local-dev"
 CLOUD_RUN_REVISION = os.environ.get("K_REVISION", "").strip() or "local"
 CLOUD_RUN_SERVICE = os.environ.get("K_SERVICE", "").strip() or "local"
 PYTHON_VERSION = platform.python_version()
+LITESTREAM_ENABLED = bool(os.environ.get("HEAR_LITESTREAM_BUCKET", "").strip())
 
 
 def get_debug_info() -> DebugInfo:
@@ -49,4 +50,6 @@ def get_debug_info() -> DebugInfo:
         python_version=PYTHON_VERSION,
         server_started_at=SERVER_STARTED_AT_ISO,
         server_uptime_seconds=int(time.time() - SERVER_START_EPOCH),
+        data_dir=str(DATA_DIR),
+        litestream_enabled=LITESTREAM_ENABLED,
     )

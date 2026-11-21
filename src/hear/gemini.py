@@ -73,7 +73,6 @@ async def _post_gemini_with_retry(
 ) -> httpx.Response:
     client = get_gemini_http_client()
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
-    last_exc: httpx.TransportError | None = None
 
     for attempt in range(max_attempts):
         try:
@@ -87,7 +86,6 @@ async def _post_gemini_with_retry(
                 max_attempts,
             )
         except httpx.TransportError as exc:
-            last_exc = exc
             if attempt == max_attempts - 1:
                 raise
             logger.warning(
@@ -98,8 +96,6 @@ async def _post_gemini_with_retry(
             )
         await asyncio.sleep(0.8 * (2**attempt))
 
-    if last_exc is not None:
-        raise last_exc
     raise RuntimeError("Unreachable retry loop exit")
 
 
@@ -242,7 +238,12 @@ async def call_gemini_tts(
         )
         return None
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        logger.warning("[TTS Warning] %s returned invalid JSON: %s", tts_model, exc)
+        return None
+
     candidates = data.get("candidates") or []
     if not candidates:
         return None
@@ -251,16 +252,22 @@ async def call_gemini_tts(
     for part in parts:
         inline = part.get("inlineData") or part.get("inline_data")
         if inline and inline.get("data"):
-            raw_bytes = base64.b64decode(inline["data"])
-            mime = str(inline.get("mimeType") or inline.get("mime_type") or "audio/pcm;rate=24000")
-            rate = 24000
-            m = re.search(r"rate=(\d+)", mime)
-            if m:
-                rate = int(m.group(1))
-            wav_bytes = pcm_to_wav_bytes(raw_bytes, sample_rate=rate)
-            audio_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
-            wav_path = AUDIO_DIR / f"{audio_id}.wav"
-            await asyncio.to_thread(_write_and_prune_wav, wav_path, wav_bytes)
-            return f"/api/audio/{audio_id}.wav"
+            try:
+                raw_bytes = base64.b64decode(inline["data"])
+                mime = str(
+                    inline.get("mimeType") or inline.get("mime_type") or "audio/pcm;rate=24000"
+                )
+                rate = 24000
+                m = re.search(r"rate=(\d+)", mime)
+                if m:
+                    rate = int(m.group(1))
+                wav_bytes = pcm_to_wav_bytes(raw_bytes, sample_rate=rate)
+                audio_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+                wav_path = AUDIO_DIR / f"{audio_id}.wav"
+                await asyncio.to_thread(_write_and_prune_wav, wav_path, wav_bytes)
+                return f"/api/audio/{audio_id}.wav"
+            except (ValueError, TypeError, OSError, wave.Error) as exc:
+                logger.warning("[TTS Warning] %s audio decode/write failed: %s", tts_model, exc)
+                return None
 
     return None

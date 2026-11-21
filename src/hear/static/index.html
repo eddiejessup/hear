@@ -694,6 +694,7 @@
     let authPromptInFlight = false;
     let pingInFlight = false;
     let lastPingSnapshot = null;
+    let activeSpeechUtterance = null;
 
     function approxDistanceMeters(lat1, lon1, lat2, lon2) {
       const r = 6371000;
@@ -877,6 +878,9 @@
         });
         if (!res.ok) return;
         const data = await res.json();
+        if (data.location?.short_label && currentCoords) {
+          currentCoords = { ...currentCoords, short_label: data.location.short_label };
+        }
         lastPingSnapshot = {
           lat: currentCoords.lat,
           lon: currentCoords.lon,
@@ -966,6 +970,9 @@
         }
 
         document.getElementById("emptyState").style.display = "none";
+        if (data.message?.location?.short_label && currentCoords) {
+          currentCoords = { ...currentCoords, short_label: data.message.location.short_label };
+        }
         appendMessageCard(data.message, true);
         updateLocationHeader(currentCoords, data.trigger_status);
       } catch (err) {
@@ -1012,6 +1019,12 @@
           input.value = text;
           addSystemBanner(`Error: ${data.detail || res.statusText}`);
           return;
+        }
+        if (data.assistant_message?.location?.short_label && currentCoords) {
+          currentCoords = {
+            ...currentCoords,
+            short_label: data.assistant_message.location.short_label,
+          };
         }
         appendMessageCard(data.assistant_message, true);
         updateLocationHeader(currentCoords, data.trigger_status);
@@ -1159,11 +1172,21 @@
       if (!("speechSynthesis" in window)) return;
       window.speechSynthesis.cancel();
       const utter = new SpeechSynthesisUtterance(text);
+      activeSpeechUtterance = utter;
       utter.rate = playbackSpeeds[speedIdx];
-      utter.onstart = () => { isPlayingAudio = true; };
+      utter.onstart = () => {
+        if (activeSpeechUtterance === utter) isPlayingAudio = true;
+      };
       utter.onend = () => {
+        if (activeSpeechUtterance !== utter) return;
+        activeSpeechUtterance = null;
         isPlayingAudio = false;
         sendPing(true);
+      };
+      utter.onerror = () => {
+        if (activeSpeechUtterance !== utter) return;
+        activeSpeechUtterance = null;
+        isPlayingAudio = false;
       };
       window.speechSynthesis.speak(utter);
     }
@@ -1363,7 +1386,20 @@
     async function resetSession() {
       const res = await apiFetch("/api/session/reset", { method: "POST" });
       if (res.ok) {
+        const data = await res.json();
+        mainAudio.pause();
+        mainAudio.removeAttribute("src");
+        mainAudio.load();
+        audioBar.classList.remove("visible");
+        if ("speechSynthesis" in window) {
+          window.speechSynthesis.cancel();
+        }
+        activeSpeechUtterance = null;
+        isPlayingAudio = false;
+        isPausedAudio = false;
+        lastPingSnapshot = null;
         document.getElementById("feed").innerHTML = `<div id="emptyState" class="empty-state">New walk session started.</div>`;
+        updateLocationHeader(currentCoords, data.trigger_status);
         closeSimDrawer();
       }
     }

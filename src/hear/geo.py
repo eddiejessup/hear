@@ -87,14 +87,6 @@ class GeoCache:
                 return entry
         return None
 
-    def get_if_close(
-        self, lat: float, lon: float, require_overpass: bool, max_dist_m: float = 25.0
-    ) -> GeoContext | None:
-        entry = self.find_close_entry(lat, lon, max_dist_m=max_dist_m)
-        if entry is not None and (not require_overpass or entry.has_overpass):
-            return entry.result
-        return None
-
     def set(
         self,
         lat: float,
@@ -276,7 +268,7 @@ async def reverse_geocode_and_context(
 
     client = get_geo_http_client()
 
-    if entry is not None and include_overpass and not entry.has_overpass:
+    if entry is not None:
         nearby_features, ov_ok = await _fetch_overpass(client, lat, lon)
         upgraded = entry.result.model_copy(update={"nearby_features": nearby_features})
         if ov_ok:

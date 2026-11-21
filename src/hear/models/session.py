@@ -93,3 +93,5 @@ class DebugInfo(HearModel):
     python_version: str
     server_started_at: str
     server_uptime_seconds: int
+    data_dir: str = ""
+    litestream_enabled: bool = False

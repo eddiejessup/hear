@@ -4,5 +4,6 @@
 __pycache__/
 *.pyc
 .env
+data/
 sessions/
 .DS_Store

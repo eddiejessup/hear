@@ -1,0 +1,5 @@
+dbs:
+  - path: ${HEAR_DATA_DIR}/hear.db
+    replica:
+      url: gs://${HEAR_LITESTREAM_BUCKET}/hear.db
+      sync-interval: 1s

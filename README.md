@@ -10,8 +10,10 @@ hear/
 ├── pyproject.toml           # Python 3.15 project config (uv, ruff, ty)
 ├── deploy/
 │   ├── check.sh             # Static analysis runner (ruff format, ruff check, ty check)
-│   ├── deploy.sh            # Cloud Run deployment script
-│   └── setup_ci.sh          # GCP Service Account & GitHub Actions Secrets provisioning
+│   ├── deploy.sh            # Cloud Run deployment script (Gen2, Litestream-enabled)
+│   ├── entrypoint.sh        # Container startup wrapper (optional Litestream restore/replicate)
+│   ├── litestream.yml       # Litestream GCS replication config for hear.db
+│   └── setup_ci.sh          # GCP APIs, Litestream GCS bucket, SA & GitHub Secrets provisioning
 └── src/
     └── hear/
         ├── __init__.py
@@ -67,10 +69,12 @@ uv run hear
 
 The server is **fail-closed** by default: when `HEAR_ALLOW_UNAUTHENTICATED` is not set, all `/api/*` endpoints require `HEAR_AUTH_TOKEN` (via `x-hear-token` header or `SameSite=Strict` cookie).
 
+Runtime data lives under `HEAR_DATA_DIR` (defaults to `./data` locally and `/data` in Docker). On Cloud Run, **Litestream** automatically restores and continuously replicates `${HEAR_DATA_DIR}/hear.db` to GCS (`gs://${HEAR_LITESTREAM_BUCKET}/hear.db`, defaulting to `<project>-hear-data`).
+
 ```bash
+# One-time (or idempotent update): enable APIs, create Litestream GCS bucket, IAM & CI secrets
+./deploy/setup_ci.sh
+
 # Deploy directly from your machine:
 ./deploy/deploy.sh
-
-# Or provision GitHub Actions CI/CD secrets (one-time):
-./deploy/setup_ci.sh
 ```
