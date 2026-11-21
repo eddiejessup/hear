@@ -12,20 +12,20 @@ cd "$ROOT_DIR"
 
 export PATH="/opt/homebrew/bin:/opt/homebrew/share/google-cloud-sdk/bin:$PATH"
 
-PROJECT="${GCP_PROJECT:-gen-lang-client-0743073374}"
-REGION="${GCP_REGION:-europe-west1}"
-LITESTREAM_BUCKET="${HEAR_LITESTREAM_BUCKET:-${PROJECT}-hear-data}"
-GH_REPO="${GH_REPO:-eddiejessup/hear}"
-SA_NAME="github-deployer"
-SA_EMAIL="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
-
-# 1. Load .env for GEMINI_API_KEY and HEAR_AUTH_TOKEN
+# 1. Load .env (before applying defaults so .env overrides work)
 if [[ -f ".env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source ".env"
   set +a
 fi
+
+PROJECT="${GCP_PROJECT:-gen-lang-client-0743073374}"
+REGION="${GCP_REGION:-europe-west1}"
+LITESTREAM_BUCKET="${HEAR_LITESTREAM_BUCKET:-${PROJECT}-hear-data}"
+GH_REPO="${GH_REPO:-eddiejessup/hear}"
+SA_NAME="github-deployer"
+SA_EMAIL="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 
 if [[ -z "${GEMINI_API_KEY:-}" ]]; then
   echo "✗ Error: GEMINI_API_KEY must be set in .env" >&2

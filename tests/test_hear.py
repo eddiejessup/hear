@@ -19,6 +19,7 @@ from hear.config import ConfigManager
 from hear.db import HearDB
 from hear.gemini import GeminiClient, pcm_to_wav_bytes, prune_old_audio_files
 from hear.geo import GeoCache, GeoService, compass_bearing_label, haversine_meters
+from hear.logging_utils import EventLogger, bind_event_context, set_event_session_id
 from hear.models.config import AppConfig, GeminiConfig, LensConfig, TriggersConfig
 from hear.models.events import BackendEventType, EventLevel, EventSource
 from hear.models.gemini import GeminiContent, GeminiPart, GeminiTextResult, GroundingSource
@@ -359,15 +360,40 @@ class TestAudioPruningAndAuth(unittest.TestCase):
                 finally:
                     sess.is_generating = False
 
-                # HTTP 4xx errors were persisted to SQLite events
+                # Authenticated 4xx errors persisted to SQLite; unauthenticated 401 probes skipped
                 events = container.db.get_recent_events(limit=20)
                 error_statuses = [
                     ev["payload"].get("status_code")
                     for ev in events
                     if ev["event_type"] == BackendEventType.HTTP_ERROR
                 ]
-                self.assertIn(401, error_statuses)
+                self.assertNotIn(401, error_statuses)
                 self.assertIn(409, error_statuses)
+                self.assertIn(422, error_statuses)
+
+    def test_static_frontend_modules_served(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_app = create_app(
+                data_dir=Path(tmpdir),
+                auth_token="test-token",
+                configure_logs=False,
+            )
+            with TestClient(test_app) as client:
+                index_resp = client.get("/")
+                self.assertEqual(index_resp.status_code, 200)
+                self.assertIn("/static/app.css", index_resp.text)
+                self.assertIn("/static/app.js", index_resp.text)
+
+                for asset in (
+                    "/static/app.css",
+                    "/static/state.js",
+                    "/static/api.js",
+                    "/static/audio.js",
+                    "/static/drawers.js",
+                    "/static/app.js",
+                ):
+                    resp = client.get(asset)
+                    self.assertEqual(resp.status_code, 200, f"Failed to serve {asset}")
 
     def test_empty_gemini_response_raises_502(self) -> None:
         fake_resp = httpx.Response(
@@ -626,6 +652,178 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
                 pruned = store.prune_old_events(max_age_days=30)
                 self.assertEqual(pruned, 1)
                 self.assertEqual(len(store.get_recent_events(client_id="elmo", limit=10)), 2)
+
+    def test_rehydration_clears_missing_audio_url_and_keeps_existing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            audio_dir = root / "audio"
+            audio_dir.mkdir()
+            (audio_dir / "present.wav").write_bytes(b"RIFF")
+            store = HearDB(root / "hear.db")
+            store.init()
+            cfg = AppConfig(
+                gemini=GeminiConfig(tts_enabled=True),
+                lenses=[LensConfig(id="l1", name="L1", prompt="P1")],
+            )
+            geo = GeoContext(
+                lat=51.5142,
+                lon=-0.0885,
+                short_label="Cornhill",
+                full_address="Cornhill, London",
+                road="Cornhill",
+                neighborhood="City",
+                city="London",
+                nearby_features=[],
+            )
+            fake_present = _FakeGeminiClient(
+                [GeminiTextResult(text="One", search_queries=[], sources=[])],
+                audio_url="/api/audio/present.wav",
+            )
+            fake_missing = _FakeGeminiClient(
+                [GeminiTextResult(text="Two", search_queries=[], sources=[])],
+                audio_url="/api/audio/missing.wav",
+            )
+            mgr1 = SessionManager(store=store, audio_dir=audio_dir, gemini=fake_present)
+            sess = mgr1.get("elmo")
+            asyncio.run(sess.execute_narration_turn(cfg, 51.5142, -0.0885, None, geo))
+            sess._gemini = fake_missing
+            asyncio.run(sess.execute_narration_turn(cfg, 51.5150, -0.0885, None, geo))
+
+            mgr2 = SessionManager(store=store, audio_dir=audio_dir)
+            restored = mgr2.get("elmo")
+            self.assertEqual(len(restored.ui_messages), 2)
+            self.assertEqual(
+                getattr(restored.ui_messages[0], "audio_url", None), "/api/audio/present.wav"
+            )
+            self.assertIsNone(getattr(restored.ui_messages[1], "audio_url", None))
+            store.close()
+
+    def test_same_second_multiple_resets_produce_unique_session_ids(self) -> None:
+        session = WalkSession(client_id="elmo")
+        seen = {session.session_id}
+        for _ in range(5):
+            session.reset(persist_deactivate=False)
+            self.assertNotIn(session.session_id, seen)
+            seen.add(session.session_id)
+
+    def test_event_ts_normalization_and_payload_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = HearDB(Path(tmpdir) / "hear.db")
+            store.init()
+            now = time.time()
+            store.record_events_batch(
+                [
+                    {
+                        "ts": (now - 10.0) * 1000.0,  # JS milliseconds
+                        "source": EventSource.FRONTEND,
+                        "level": EventLevel.INFO,
+                        "event_type": "js_ms_event",
+                        "client_id": "elmo",
+                        "payload": {"ok": True},
+                    },
+                    {
+                        "ts": now + 999999.0,  # Far future timestamp
+                        "source": EventSource.FRONTEND,
+                        "level": EventLevel.INFO,
+                        "event_type": "future_event",
+                        "client_id": "elmo",
+                        "payload": {"blob": "x" * 20000},
+                    },
+                ]
+            )
+            events = {e["event_type"]: e for e in store.get_recent_events(client_id="elmo")}
+            self.assertAlmostEqual(events["js_ms_event"]["ts"], now - 10.0, delta=2.0)
+            self.assertLessEqual(events["future_event"]["ts"], time.time() + 1.0)
+            self.assertTrue(events["future_event"]["payload"].get("_truncated"))
+            store.close()
+
+    def test_event_logger_contextvar_correlation_and_malformed_text_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = HearDB(Path(tmpdir) / "hear.db")
+            store.init()
+            ev_logger = EventLogger(store=store)
+            mock_http = AsyncMock(spec=httpx.AsyncClient)
+            mock_http.is_closed = False
+            mock_http.post.return_value = httpx.Response(200, content=b"not-json")
+            gemini = GeminiClient(
+                audio_dir=Path(tmpdir),
+                api_key="fake-key",
+                http_client=mock_http,
+                event_logger=ev_logger,
+            )
+            with bind_event_context(client_id="elmo"):
+                set_event_session_id("sess_ctx_1")
+                with self.assertRaises(HTTPException) as ctx:
+                    asyncio.run(
+                        gemini.generate_text(
+                            contents=[GeminiContent(role="user", parts=[GeminiPart(text="Hi")])],
+                            system_prompt="System",
+                            model="gemini-3.8-flash",
+                        )
+                    )
+                self.assertEqual(ctx.exception.status_code, 502)
+
+            events = store.get_recent_events(client_id="elmo", session_id="sess_ctx_1")
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event_type"], BackendEventType.GEMINI_TEXT_ERROR)
+            store.close()
+
+    def test_last_audio_ended_at_persists_without_creating_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = HearDB(Path(tmpdir) / "hear.db")
+            store.init()
+            # Updating a non-existent session should not insert a row
+            store.update_last_audio_ended_at("missing_session", 1234.5)
+            self.assertIsNone(store.load_latest_active_session("elmo"))
+
+            # Updating an existing session persists last_audio_ended_at across reload
+            cfg = AppConfig(
+                gemini=GeminiConfig(tts_enabled=True),
+                lenses=[LensConfig(id="l1", name="L1", prompt="P1")],
+            )
+            geo = GeoContext(
+                lat=51.5142,
+                lon=-0.0885,
+                short_label="Cornhill",
+                full_address="Cornhill, London",
+                road="Cornhill",
+                neighborhood="City",
+                city="London",
+                nearby_features=[],
+            )
+            fake_gemini = _FakeGeminiClient(
+                [GeminiTextResult(text="Hi", search_queries=[], sources=[])],
+                audio_url="/api/audio/clip.wav",
+            )
+            sess = WalkSession(client_id="elmo", store=store, gemini=fake_gemini)
+            asyncio.run(sess.execute_narration_turn(cfg, 51.5142, -0.0885, None, geo))
+            changed = sess.update_audio_state(
+                lat=51.5142,
+                lon=-0.0885,
+                is_playing_audio=False,
+                audio_just_ended=True,
+                now=5000.0,
+            )
+            self.assertTrue(changed)
+            asyncio.run(sess.persist_last_audio_ended_at())
+
+            reloaded = store.load_latest_active_session("elmo")
+            self.assertIsNotNone(reloaded)
+            assert reloaded is not None
+            self.assertAlmostEqual(reloaded.last_audio_ended_at or 0.0, 5000.0)
+            store.close()
+
+    def test_config_manager_readonly_yaml_save_not_clobbered_by_get(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_path = Path(tmpdir) / "config.yaml"
+            cfg_path.write_text("system_prompt: Disk prompt\n", encoding="utf-8")
+            store = HearDB(Path(tmpdir) / "hear.db")
+            store.init()
+            mgr = ConfigManager(cfg_path, store=store)
+            with patch("os.replace", side_effect=OSError("read-only filesystem")):
+                mgr.save(AppConfig(system_prompt="SQLite prompt"))
+            self.assertEqual(mgr.get().system_prompt, "SQLite prompt")
+            store.close()
 
 
 if __name__ == "__main__":

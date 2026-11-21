@@ -78,12 +78,6 @@ class AssistantMessage(HearModel):
 type UIMessage = UserChatMessage | AssistantMessage
 
 
-class SessionTranscript(HearModel):
-    session_id: str
-    started_at: float
-    messages: list[UIMessage]
-
-
 class DebugInfo(HearModel):
     git_commit: str
     git_commit_time: str

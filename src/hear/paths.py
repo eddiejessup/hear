@@ -53,10 +53,6 @@ class AppPaths:
         return self.data_dir / "hear.db"
 
     @property
-    def sessions_dir(self) -> Path:
-        return self.data_dir / "sessions"
-
-    @property
     def audio_dir(self) -> Path:
         return self.data_dir / "audio"
 
@@ -66,6 +62,5 @@ class AppPaths:
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.static_dir.mkdir(parents=True, exist_ok=True)

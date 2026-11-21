@@ -3,13 +3,40 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
+from collections.abc import Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
 
 from hear.db import HearDB
 from hear.models.events import BackendEventType, EventLevel, EventSource
+
+_ctx_client_id: ContextVar[str | None] = ContextVar("hear_client_id", default=None)
+_ctx_session_id: ContextVar[str | None] = ContextVar("hear_session_id", default=None)
+
+
+@contextmanager
+def bind_event_context(
+    *, client_id: str | None = None, session_id: str | None = None
+) -> Generator[None]:
+    """Bind request/session correlation IDs for nested EventLogger calls."""
+    tok_client = _ctx_client_id.set(client_id)
+    tok_session = _ctx_session_id.set(session_id)
+    try:
+        yield
+    finally:
+        _ctx_client_id.reset(tok_client)
+        _ctx_session_id.reset(tok_session)
+
+
+def set_event_session_id(session_id: str | None) -> None:
+    """Update the active request's correlated session_id inside a bound context."""
+    _ctx_session_id.set(session_id)
+
 
 _LEVEL_TO_SEVERITY = {
     logging.DEBUG: "DEBUG",
@@ -54,10 +81,17 @@ class CloudJsonFormatter(logging.Formatter):
         return json.dumps(entry, default=str)
 
 
-def configure_logging(level: int = logging.INFO) -> None:
+def _resolve_log_level(level: int | str | None) -> int:
+    if isinstance(level, int):
+        return level
+    raw = (level if level is not None else os.environ.get("HEAR_LOG_LEVEL", "INFO")).strip().upper()
+    return logging.getLevelNamesMapping().get(raw, logging.INFO)
+
+
+def configure_logging(level: int | str | None = None) -> None:
     """Configure the 'hear' logger hierarchy to emit structured JSON to stdout."""
     hear_logger = logging.getLogger("hear")
-    hear_logger.setLevel(level)
+    hear_logger.setLevel(_resolve_log_level(level))
     if not any(isinstance(h.formatter, CloudJsonFormatter) for h in hear_logger.handlers):
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(CloudJsonFormatter())
@@ -72,6 +106,30 @@ class EventLogger:
         self._store = store
         self._logger = logging.getLogger(logger_name)
 
+    def _emit(
+        self,
+        event_type: BackendEventType | str,
+        *,
+        level: EventLevel,
+        session_id: str | None,
+        client_id: str | None,
+        payload: dict[str, Any],
+    ) -> tuple[str | None, str | None]:
+        resolved_session_id = session_id if session_id is not None else _ctx_session_id.get()
+        resolved_client_id = client_id if client_id is not None else _ctx_client_id.get()
+        py_level = _EVENT_LEVEL_TO_PY.get(level, logging.INFO)
+        self._logger.log(
+            py_level,
+            str(event_type),
+            extra={
+                "event_type": str(event_type),
+                "session_id": resolved_session_id,
+                "client_id": resolved_client_id,
+                "payload": payload,
+            },
+        )
+        return resolved_session_id, resolved_client_id
+
     def log(
         self,
         event_type: BackendEventType | str,
@@ -82,16 +140,12 @@ class EventLogger:
         persist: bool = True,
         **payload: Any,
     ) -> None:
-        py_level = _EVENT_LEVEL_TO_PY.get(level, logging.INFO)
-        self._logger.log(
-            py_level,
-            str(event_type),
-            extra={
-                "event_type": str(event_type),
-                "session_id": session_id,
-                "client_id": client_id,
-                "payload": payload,
-            },
+        resolved_session_id, resolved_client_id = self._emit(
+            event_type,
+            level=level,
+            session_id=session_id,
+            client_id=client_id,
+            payload=payload,
         )
         if persist and self._store is not None:
             try:
@@ -100,8 +154,8 @@ class EventLogger:
                     level=level,
                     event_type=event_type,
                     payload=payload,
-                    session_id=session_id,
-                    client_id=client_id,
+                    session_id=resolved_session_id,
+                    client_id=resolved_client_id,
                     ts=time.time(),
                 )
             except Exception as exc:  # noqa: BLE001
@@ -117,16 +171,12 @@ class EventLogger:
         persist: bool = True,
         **payload: Any,
     ) -> None:
-        py_level = _EVENT_LEVEL_TO_PY.get(level, logging.INFO)
-        self._logger.log(
-            py_level,
-            str(event_type),
-            extra={
-                "event_type": str(event_type),
-                "session_id": session_id,
-                "client_id": client_id,
-                "payload": payload,
-            },
+        resolved_session_id, resolved_client_id = self._emit(
+            event_type,
+            level=level,
+            session_id=session_id,
+            client_id=client_id,
+            payload=payload,
         )
         if persist and self._store is not None:
             try:
@@ -136,8 +186,8 @@ class EventLogger:
                     level=level,
                     event_type=event_type,
                     payload=payload,
-                    session_id=session_id,
-                    client_id=client_id,
+                    session_id=resolved_session_id,
+                    client_id=resolved_client_id,
                     ts=time.time(),
                 )
             except Exception as exc:  # noqa: BLE001

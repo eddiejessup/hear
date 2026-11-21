@@ -6,11 +6,12 @@ import re
 import time
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Protocol
 
 from hear.db import HearDB, PersistedSessionState
 from hear.geo import compass_bearing_label, haversine_meters
-from hear.logging_utils import EventLogger
+from hear.logging_utils import EventLogger, bind_event_context
 from hear.models.config import AppConfig, LensConfig
 from hear.models.events import BackendEventType
 from hear.models.gemini import GeminiContent, GeminiPart, GeminiTextResult
@@ -128,11 +129,8 @@ class WalkSession:
 
         ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         suffix = self.client_id[:8]
-        # Include a short random tag when resetting within the same second to guarantee uniqueness
-        candidate_id = f"{ts}_{suffix}" if suffix != "default" else ts
-        if candidate_id == previous_id:
-            candidate_id = f"{candidate_id}_{uuid.uuid4().hex[:4]}"
-        self.session_id = candidate_id
+        tag = uuid.uuid4().hex[:6]
+        self.session_id = f"{ts}_{suffix}_{tag}" if suffix != "default" else f"{ts}_{tag}"
         self.started_at = time.time()
         self.last_active_at = self.started_at
         self.gemini_contents = []
@@ -148,6 +146,14 @@ class WalkSession:
         self.paused_at = None
         self.paused_location = None
         self._last_recorded_loc = None
+
+    async def reset_async(self) -> str:
+        """Mark the previous session inactive off the event loop, then reset in-memory state."""
+        previous_id = self.session_id
+        if previous_id and self._store is not None:
+            await asyncio.to_thread(self._store.mark_session_inactive, previous_id)
+        self.reset(persist_deactivate=False)
+        return previous_id
 
     def should_record_location_sample(self, lat: float, lon: float, now: float) -> bool:
         if self._last_recorded_loc is None:
@@ -187,12 +193,14 @@ class WalkSession:
         is_paused_audio: bool = False,
         audio_just_ended: bool = False,
         now: float | None = None,
-    ) -> None:
+    ) -> bool:
         ts = now if now is not None else time.time()
+        audio_ended_updated = False
         if audio_just_ended or (
             self.is_playing_audio and not is_playing_audio and not is_paused_audio
         ):
             self.last_audio_ended_at = ts
+            audio_ended_updated = True
 
         if is_paused_audio and not is_playing_audio:
             if not self.is_paused_audio or self.paused_at is None:
@@ -204,6 +212,16 @@ class WalkSession:
 
         self.is_playing_audio = is_playing_audio
         self.is_paused_audio = is_paused_audio and not is_playing_audio
+        return audio_ended_updated
+
+    async def persist_last_audio_ended_at(self) -> None:
+        if self._store is None or self.last_audio_ended_at is None:
+            return
+        await asyncio.to_thread(
+            self._store.update_last_audio_ended_at,
+            self.session_id,
+            self.last_audio_ended_at,
+        )
 
     def is_pause_hold_active(self, now: float) -> bool:
         """Return True if audio is paused mid-clip and hasn't expired via time + distance."""
@@ -248,27 +266,28 @@ class WalkSession:
         user_turn = GeminiContent(role="user", parts=[GeminiPart(text=user_prompt_text)])
         trial_contents: list[GeminiContent] = [*self.gemini_contents, user_turn]
 
-        t_llm = time.monotonic()
-        llm_result = await self._gemini.generate_text(
-            contents=trial_contents,
-            system_prompt=config.system_prompt,
-            model=gemini_cfg.model,
-            temperature=gemini_cfg.temperature,
-            enable_google_search=gemini_cfg.enable_google_search,
-        )
-        llm_latency_ms = int((time.monotonic() - t_llm) * 1000)
-
-        audio_url: str | None = None
-        tts_latency_ms: int | None = None
-        if gemini_cfg.tts_enabled:
-            t_tts = time.monotonic()
-            audio_url = await self._gemini.generate_tts(
-                text=llm_result.text,
-                tts_model=gemini_cfg.tts_model,
-                voice_name=gemini_cfg.tts_voice,
-                style_prompt=gemini_cfg.tts_style_prompt,
+        with bind_event_context(client_id=self.client_id, session_id=self.session_id):
+            t_llm = time.monotonic()
+            llm_result = await self._gemini.generate_text(
+                contents=trial_contents,
+                system_prompt=config.system_prompt,
+                model=gemini_cfg.model,
+                temperature=gemini_cfg.temperature,
+                enable_google_search=gemini_cfg.enable_google_search,
             )
-            tts_latency_ms = int((time.monotonic() - t_tts) * 1000)
+            llm_latency_ms = int((time.monotonic() - t_llm) * 1000)
+
+            audio_url: str | None = None
+            tts_latency_ms: int | None = None
+            if gemini_cfg.tts_enabled:
+                t_tts = time.monotonic()
+                audio_url = await self._gemini.generate_tts(
+                    text=llm_result.text,
+                    tts_model=gemini_cfg.tts_model,
+                    voice_name=gemini_cfg.tts_voice,
+                    style_prompt=gemini_cfg.tts_style_prompt,
+                )
+                tts_latency_ms = int((time.monotonic() - t_tts) * 1000)
 
         now = time.time()
         model_turn = GeminiContent(role="model", parts=[GeminiPart(text=llm_result.text)])
@@ -611,12 +630,14 @@ class SessionManager:
         *,
         max_sessions: int = MAX_ACTIVE_SESSIONS,
         store: HearDB | None = None,
+        audio_dir: Path | None = None,
         gemini: TextAndTtsClient | None = None,
         event_logger: EventLogger | None = None,
     ) -> None:
         self._sessions: dict[str, WalkSession] = {}
         self._max_sessions = max_sessions
         self._store = store
+        self._audio_dir = audio_dir
         self._gemini = gemini
         self._events = event_logger if event_logger is not None else EventLogger(store=store)
 
@@ -632,7 +653,7 @@ class SessionManager:
                 self._sessions.pop(oldest_key, None)
 
             persisted = (
-                self._store.load_latest_active_session(client_id)
+                self._store.load_latest_active_session(client_id, audio_dir=self._audio_dir)
                 if self._store is not None
                 else None
             )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -21,6 +22,8 @@ from hear.models.session import (
 )
 
 SCHEMA_VERSION = 1
+MAX_EVENT_PAYLOAD_BYTES = 8192
+_MAX_FUTURE_TS_SKEW_SECONDS = 300.0
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -182,6 +185,29 @@ def _safe_json_loads(raw: str | None, fallback: Any) -> Any:
         return fallback
 
 
+def _normalize_event_ts(raw_ts: Any, now: float) -> float:
+    if isinstance(raw_ts, bool) or not isinstance(raw_ts, (int, float)):
+        return now
+    ts = float(raw_ts)
+    if not math.isfinite(ts):
+        return now
+    # Normalize JS millisecond timestamps (e.g. Date.now()) into Unix seconds
+    if ts > 1e11:
+        ts /= 1000.0
+    if ts <= 0.0 or ts > now + _MAX_FUTURE_TS_SKEW_SECONDS:
+        return now
+    return ts
+
+
+def _serialize_event_payload(payload: Any) -> str:
+    raw = json.dumps(payload or {}, default=str)
+    if len(raw.encode("utf-8")) <= MAX_EVENT_PAYLOAD_BYTES:
+        return raw
+    preview_limit = max(0, MAX_EVENT_PAYLOAD_BYTES - 128)
+    preview = raw.encode("utf-8")[:preview_limit].decode("utf-8", errors="ignore")
+    return json.dumps({"_truncated": True, "_preview": preview})
+
+
 class HearDB:
     """Thread-safe SQLite store (WAL mode) for sessions, messages, events, and config."""
 
@@ -224,35 +250,6 @@ class HearDB:
                 finally:
                     self._conn.close()
                     self._conn = None
-
-    def upsert_session(
-        self,
-        *,
-        session_id: str,
-        client_id: str,
-        started_at: float,
-        last_active_at: float,
-        is_active: bool = True,
-        last_trigger_location: TriggerLocation | None = None,
-        last_trigger_time: float | None = None,
-        last_audio_ended_at: float | None = None,
-        used_lens_ids: list[str] | None = None,
-    ) -> None:
-        with self._lock:
-            conn = self._connect()
-            self._upsert_session_in_tx(
-                conn,
-                session_id=session_id,
-                client_id=client_id,
-                started_at=started_at,
-                last_active_at=last_active_at,
-                is_active=is_active,
-                last_trigger_location=last_trigger_location,
-                last_trigger_time=last_trigger_time,
-                last_audio_ended_at=last_audio_ended_at,
-                used_lens_ids=used_lens_ids or [],
-            )
-            conn.commit()
 
     @staticmethod
     def _upsert_session_in_tx(
@@ -312,6 +309,21 @@ class HearDB:
                 (time.time(), session_id),
             )
             conn.commit()
+
+    def update_last_audio_ended_at(self, session_id: str, ts: float) -> None:
+        if not session_id:
+            return
+        with self._lock:
+            conn = self._connect()
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET last_audio_ended_at = ?, last_active_at = ?
+                    WHERE session_id = ?
+                    """,
+                    (ts, ts, session_id),
+                )
 
     def save_narration_turn(
         self,
@@ -492,7 +504,9 @@ class HearDB:
             ),
         )
 
-    def load_latest_active_session(self, client_id: str) -> PersistedSessionState | None:
+    def load_latest_active_session(
+        self, client_id: str, *, audio_dir: Path | None = None
+    ) -> PersistedSessionState | None:
         with self._lock:
             conn = self._connect()
             row = conn.execute(
@@ -565,6 +579,14 @@ class HearDB:
                     raw_queries = _safe_json_loads(m["search_queries_json"], [])
                     queries = [str(q) for q in raw_queries] if isinstance(raw_queries, list) else []
 
+                    audio_url: str | None = m["audio_url"]
+                    if (
+                        audio_url
+                        and audio_dir is not None
+                        and not (audio_dir / Path(audio_url).name).exists()
+                    ):
+                        audio_url = None
+
                     ui_messages.append(
                         AssistantMessage(
                             id=str(m["id"]),
@@ -575,7 +597,7 @@ class HearDB:
                             reason=m["reason"],
                             model=str(m["model"] or ""),
                             text=text,
-                            audio_url=m["audio_url"],
+                            audio_url=audio_url,
                             sources=sources,
                             search_queries=queries,
                         )
@@ -697,9 +719,8 @@ class HearDB:
         now = time.time()
         rows: list[tuple[float, str, str, str | None, str | None, str, str]] = []
         for item in items:
-            raw_ts = item.get("ts")
-            ts = float(raw_ts) if isinstance(raw_ts, (int, float)) else now
-            payload_json = json.dumps(item.get("payload") or {}, default=str)
+            ts = _normalize_event_ts(item.get("ts"), now)
+            payload_json = _serialize_event_payload(item.get("payload"))
             rows.append(
                 (
                     ts,

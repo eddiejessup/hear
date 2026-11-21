@@ -6,6 +6,14 @@ cd "$ROOT_DIR"
 
 export PATH="/opt/homebrew/bin:/opt/homebrew/share/google-cloud-sdk/bin:$PATH"
 
+# Load .env if present (before applying defaults so .env overrides work)
+if [[ -f ".env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source ".env"
+  set +a
+fi
+
 SERVICE_NAME="${SERVICE_NAME:-hear}"
 REGION="${GCP_REGION:-europe-west1}"
 PROJECT="${GCP_PROJECT:-gen-lang-client-0743073374}"
@@ -14,14 +22,6 @@ LITESTREAM_BUCKET="${HEAR_LITESTREAM_BUCKET:-${PROJECT}-hear-data}"
 if [[ "${1:-}" != "--skip-checks" ]]; then
   echo "▸ Running pre-deploy static analysis checks..."
   ./deploy/check.sh
-fi
-
-# Load .env if present
-if [[ -f ".env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source ".env"
-  set +a
 fi
 
 if [[ -z "${GEMINI_API_KEY:-}" ]]; then

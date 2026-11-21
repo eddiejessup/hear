@@ -208,7 +208,21 @@ class GeminiClient:
                 status_code=resp.status_code, detail=f"Gemini API error ({model}): {err_text}"
             )
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            await self._events.log_async(
+                BackendEventType.GEMINI_TEXT_ERROR,
+                level=EventLevel.ERROR,
+                model=model,
+                error=f"invalid_json: {exc}",
+                latency_ms=int((time.monotonic() - t0) * 1000),
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Gemini returned invalid JSON ({model}): {exc}",
+            ) from exc
+
         candidates = data.get("candidates") or []
         if not candidates:
             await self._events.log_async(

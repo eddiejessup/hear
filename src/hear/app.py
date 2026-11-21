@@ -11,6 +11,7 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from hear.auth import AuthSettings, EnvReader, verify_token
 from hear.config import ConfigManager
@@ -18,7 +19,12 @@ from hear.db import HearDB
 from hear.debug import RuntimeDebugProvider
 from hear.gemini import GeminiClient
 from hear.geo import GeoService
-from hear.logging_utils import EventLogger, configure_logging
+from hear.logging_utils import (
+    EventLogger,
+    bind_event_context,
+    configure_logging,
+    set_event_session_id,
+)
 from hear.models.api import (
     ChatRequest,
     ChatResponse,
@@ -85,7 +91,12 @@ def build_container(
         env=resolved_env,
         event_logger=events,
     )
-    sessions = SessionManager(store=store, gemini=gemini_client, event_logger=events)
+    sessions = SessionManager(
+        store=store,
+        audio_dir=resolved_paths.audio_dir,
+        gemini=gemini_client,
+        event_logger=events,
+    )
     debug = RuntimeDebugProvider(resolved_paths, resolved_env)
     return AppContainer(
         paths=resolved_paths,
@@ -130,6 +141,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         await asyncio.to_thread(c.db.init)
+        await asyncio.to_thread(c.config_manager.get)
         pruned = await asyncio.to_thread(c.db.prune_old_events, 30)
         await c.events.log_async(
             BackendEventType.SERVER_STARTED,
@@ -144,9 +156,12 @@ def create_app(
 
     app = FastAPI(title="Hear — Historical Walking Companion", lifespan=lifespan)
     app.state.container = c
+    app.mount("/static", StaticFiles(directory=c.paths.static_dir), name="static")
 
     def _get_session(request: Request) -> WalkSession:
-        return c.session_manager.get(_extract_client_id(request))
+        session = c.session_manager.get(_extract_client_id(request))
+        set_event_session_id(session.session_id)
+        return session
 
     @app.middleware("http")
     async def auth_middleware(
@@ -182,48 +197,50 @@ def create_app(
         t0 = time.monotonic()
         path = request.url.path
         client_id = _extract_client_id(request) if path.startswith("/api/") else None
-        try:
-            response = await call_next(request)
-        except Exception as exc:
-            latency_ms = int((time.monotonic() - t0) * 1000)
-            await c.events.log_async(
-                BackendEventType.HTTP_UNHANDLED_ERROR,
-                level=EventLevel.ERROR,
-                client_id=client_id,
-                method=request.method,
-                path=path,
-                latency_ms=latency_ms,
-                error=str(exc),
-                error_type=type(exc).__name__,
-            )
-            raise
-
-        latency_ms = int((time.monotonic() - t0) * 1000)
-        if path.startswith("/api/"):
-            status = response.status_code
-            # Persist API errors/warnings to SQLite; keep routine 2xx traffic in stdout JSON logs
-            if status >= 400:
+        with bind_event_context(client_id=client_id):
+            try:
+                response = await call_next(request)
+            except Exception as exc:
+                latency_ms = int((time.monotonic() - t0) * 1000)
                 await c.events.log_async(
-                    BackendEventType.HTTP_ERROR,
-                    level=EventLevel.ERROR if status >= 500 else EventLevel.WARN,
+                    BackendEventType.HTTP_UNHANDLED_ERROR,
+                    level=EventLevel.ERROR,
                     client_id=client_id,
                     method=request.method,
                     path=path,
-                    status_code=status,
                     latency_ms=latency_ms,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
                 )
-            elif path != "/api/events":
-                c.events.log(
-                    BackendEventType.HTTP_REQUEST,
-                    level=EventLevel.INFO,
-                    client_id=client_id,
-                    persist=False,
-                    method=request.method,
-                    path=path,
-                    status_code=status,
-                    latency_ms=latency_ms,
-                )
-        return response
+                raise
+
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            if path.startswith("/api/"):
+                status = response.status_code
+                # Persist authenticated API errors to SQLite; keep 401/503 probes and 2xx in stdout
+                if status >= 400:
+                    await c.events.log_async(
+                        BackendEventType.HTTP_ERROR,
+                        level=EventLevel.ERROR if status >= 500 else EventLevel.WARN,
+                        client_id=client_id,
+                        persist=status not in {401, 503},
+                        method=request.method,
+                        path=path,
+                        status_code=status,
+                        latency_ms=latency_ms,
+                    )
+                elif path != "/api/events":
+                    c.events.log(
+                        BackendEventType.HTTP_REQUEST,
+                        level=EventLevel.INFO,
+                        client_id=client_id,
+                        persist=False,
+                        method=request.method,
+                        path=path,
+                        status_code=status,
+                        latency_ms=latency_ms,
+                    )
+            return response
 
     @app.get("/", response_model=None)
     async def index() -> Response:
@@ -253,13 +270,15 @@ def create_app(
         session = _get_session(request)
         cfg = c.config_manager.get()
 
-        session.update_audio_state(
+        audio_ended_updated = session.update_audio_state(
             lat=req.lat,
             lon=req.lon,
             is_playing_audio=req.is_playing_audio,
             is_paused_audio=req.is_paused_audio,
             audio_just_ended=req.audio_just_ended,
         )
+        if audio_ended_updated:
+            await session.persist_last_audio_ended_at()
 
         prefetch_overpass = session.should_prefetch_overpass(cfg, req.lat, req.lon)
         geo = await c.geo.reverse_geocode_and_context(
@@ -439,8 +458,8 @@ def create_app(
     async def reset_session(request: Request) -> ResetSessionResponse:
         session = _get_session(request)
         async with session.lock:
-            previous_id = session.session_id
-            await asyncio.to_thread(session.reset)
+            previous_id = await session.reset_async()
+            set_event_session_id(session.session_id)
             cfg = c.config_manager.get()
             await c.events.log_async(
                 BackendEventType.SESSION_RESET,
