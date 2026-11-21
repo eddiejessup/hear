@@ -394,6 +394,7 @@ class TestAudioPruningAndAuth(unittest.TestCase):
                     "/static/app.css",
                     "/static/state.js",
                     "/static/api.js",
+                    "/static/telemetry.js",
                     "/static/audio.js",
                     "/static/drawers.js",
                     "/static/app.js",

@@ -7,6 +7,8 @@ export function createAudioController({
   state,
   onAudioEnded,
   onNextTrack,
+  onMediaSessionAction = () => {},
+  onKeepAliveError = () => {},
 }) {
   let keepAliveAudio = null;
   let activeSpeechUtterance = null;
@@ -110,13 +112,21 @@ export function createAudioController({
 
   function setupMediaSession() {
     if (!("mediaSession" in navigator)) return;
-    navigator.mediaSession.setActionHandler("play", () => mainAudio.play());
-    navigator.mediaSession.setActionHandler("pause", () => mainAudio.pause());
+    navigator.mediaSession.setActionHandler("play", () => {
+      onMediaSessionAction("play");
+      mainAudio.play();
+    });
+    navigator.mediaSession.setActionHandler("pause", () => {
+      onMediaSessionAction("pause");
+      mainAudio.pause();
+    });
     // Double-tap on Pixel Buds ("nexttrack") triggers "Tell me about here"!
     navigator.mediaSession.setActionHandler("nexttrack", () => {
+      onMediaSessionAction("nexttrack");
       onNextTrack("earbud_nexttrack");
     });
     navigator.mediaSession.setActionHandler("previoustrack", () => {
+      onMediaSessionAction("previoustrack");
       if (mainAudio.src) {
         mainAudio.currentTime = 0;
         mainAudio.play();
@@ -159,9 +169,12 @@ export function createAudioController({
         .then(() => {
           patchSection("playback", { keepAliveActive: true }, "keepalive_started");
         })
-        .catch(() => {});
+        .catch((err) => {
+          onKeepAliveError(err?.name || err?.message || "play_rejected");
+        });
     } catch (e) {
       console.warn("Silent keep-alive init failed:", e);
+      onKeepAliveError(e?.message || "init_failed");
     }
   }
 

@@ -24,10 +24,13 @@ import {
   setTopLevelState,
   subscribeState,
 } from "./state.js";
+import { FrontendEventType, TelemetryLevel, createTelemetryClient } from "./telemetry.js";
 
 const mainAudio = document.getElementById("mainAudio");
 const audioBar = document.getElementById("audioBar");
 const speedBtn = document.getElementById("speedBtn");
+
+const telemetry = createTelemetryClient({ state: appState });
 
 const audio = createAudioController({
   mainAudio,
@@ -36,6 +39,10 @@ const audio = createAudioController({
   state: appState,
   onAudioEnded: () => sendPing(true),
   onNextTrack: (reason) => triggerNarration(reason),
+  onMediaSessionAction: (action) =>
+    telemetry.track(FrontendEventType.MEDIASESSION_ACTION, { action }),
+  onKeepAliveError: (error) =>
+    telemetry.track(FrontendEventType.KEEPALIVE_FAILED, { error }, TelemetryLevel.WARN),
 });
 
 const drawers = createDrawersController({
@@ -175,6 +182,13 @@ function renderStateUI() {
         `${appState.network.status} • ping ${formatAgeShort(appState.network.lastPingAt, nowMs)}${appState.network.lastError ? ` (${appState.network.lastError})` : ""}`,
       ],
       ["Session", appState.sessionId || "--"],
+      [
+        "Telemetry",
+        (() => {
+          const s = telemetry.getStats();
+          return `q:${s.buffered} • sent:${s.sent}${s.dropped ? ` • drop:${s.dropped}` : ""}`;
+        })(),
+      ],
     ];
     if (appState.gps.lastError) {
       items.push(["GPS Error", appState.gps.lastError]);
@@ -289,11 +303,16 @@ async function init() {
   bindDomEvents();
   audio.setupAudioEvents();
   audio.setupMediaSession();
+  telemetry.start();
   renderStateUI();
   await fetchInitialState();
+  telemetry.flush();
   startGpsWatch();
   setInterval(periodicPing, 6000);
-  setInterval(renderStateUI, 1000);
+  setInterval(() => {
+    telemetry.checkGpsStaleness();
+    renderStateUI();
+  }, 1000);
 }
 
 async function fetchInitialState() {
@@ -305,6 +324,11 @@ async function fetchInitialState() {
         "network",
         { status: NetworkState.ERROR, lastError: `HTTP ${res.status}` },
         "state_error"
+      );
+      telemetry.track(
+        FrontendEventType.API_ERROR,
+        { endpoint: "/api/state", status_code: res.status, detail: err.detail || res.statusText },
+        TelemetryLevel.ERROR
       );
       addSystemBanner(`⚠️ ${err.detail || res.statusText}`);
       return;
@@ -350,6 +374,11 @@ async function fetchInitialState() {
       "network",
       { status: NetworkState.ERROR, lastError: err?.message || "init_failed" },
       "state_error"
+    );
+    telemetry.track(
+      FrontendEventType.API_ERROR,
+      { endpoint: "/api/state", error: err?.message || "init_failed" },
+      TelemetryLevel.ERROR
     );
   }
 }
@@ -452,6 +481,11 @@ async function sendPing(audioJustEnded = false) {
         { status: NetworkState.ERROR, lastError: `Ping HTTP ${res.status}` },
         "ping_error"
       );
+      telemetry.track(
+        FrontendEventType.API_ERROR,
+        { endpoint: "/api/ping", status_code: res.status },
+        TelemetryLevel.WARN
+      );
       return;
     }
     const data = await res.json();
@@ -497,6 +531,11 @@ async function sendPing(audioJustEnded = false) {
       },
       "ping_error"
     );
+    telemetry.track(
+      FrontendEventType.API_ERROR,
+      { endpoint: "/api/ping", error: err?.message || "network_error" },
+      TelemetryLevel.WARN
+    );
   } finally {
     appState.network.pingInFlight = false;
   }
@@ -516,6 +555,12 @@ async function triggerNarration(reason = "manual") {
   }
 
   audio.ensureSilentKeepAlive();
+  telemetry.track(FrontendEventType.NARRATION_TRIGGERED, {
+    reason,
+    lens_id: appState.selectedLensId || null,
+    gps_status: getEffectiveGpsStatus(appState),
+    visibility: appState.device.visibility,
+  });
   patchSection(
     "generation",
     { status: GenerationState.NARRATING, startedAt: Date.now(), reason },
@@ -546,6 +591,11 @@ async function triggerNarration(reason = "manual") {
           { status: NetworkState.ERROR, lastError: `Narrate HTTP ${res.status}` },
           "narration_error"
         );
+        telemetry.track(
+          FrontendEventType.API_ERROR,
+          { endpoint: "/api/narrate", status_code: res.status, reason },
+          TelemetryLevel.ERROR
+        );
         addSystemBanner(`Error: ${data.detail || res.statusText}`);
       }
       return;
@@ -572,6 +622,11 @@ async function triggerNarration(reason = "manual") {
       "network",
       { status: NetworkState.ERROR, lastError: err?.message || "network_error" },
       "narration_error"
+    );
+    telemetry.track(
+      FrontendEventType.API_ERROR,
+      { endpoint: "/api/narrate", error: err?.message || "network_error", reason },
+      TelemetryLevel.ERROR
     );
     addSystemBanner(`Network error: ${err.message}`);
   } finally {
@@ -630,6 +685,11 @@ async function sendChat(event) {
         { status: NetworkState.ERROR, lastError: `Chat HTTP ${res.status}` },
         "chat_error"
       );
+      telemetry.track(
+        FrontendEventType.API_ERROR,
+        { endpoint: "/api/chat", status_code: res.status },
+        TelemetryLevel.ERROR
+      );
       addSystemBanner(`Error: ${data.detail || res.statusText}`);
       return;
     }
@@ -659,6 +719,11 @@ async function sendChat(event) {
       "network",
       { status: NetworkState.ERROR, lastError: err?.message || "network_error" },
       "chat_error"
+    );
+    telemetry.track(
+      FrontendEventType.API_ERROR,
+      { endpoint: "/api/chat", error: err?.message || "network_error" },
+      TelemetryLevel.ERROR
     );
     addSystemBanner(`Chat error: ${err.message}`);
   } finally {
