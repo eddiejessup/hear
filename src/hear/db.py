@@ -55,7 +55,6 @@ CREATE TABLE IF NOT EXISTS messages (
     lat REAL,
     lon REAL,
     short_label TEXT,
-    nearby_features_json TEXT NOT NULL DEFAULT '[]',
     lens_id TEXT,
     lens_name TEXT,
     era TEXT,
@@ -463,13 +462,13 @@ class HearDB:
             """
             INSERT OR REPLACE INTO messages (
                 id, session_id, client_id, role, type, ts,
-                lat, lon, short_label, nearby_features_json,
+                lat, lon, short_label,
                 lens_id, lens_name, era, scale, topic_summary, entities_json,
                 reason, model, text, prompt_text, audio_url,
                 sources_json, search_queries_json, llm_latency_ms, tts_latency_ms
             ) VALUES (
                 ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?,
+                ?, ?, ?,
                 ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?, ?,
                 ?, ?, ?, ?
@@ -485,7 +484,6 @@ class HearDB:
                 loc.lat if loc else None,
                 loc.lon if loc else None,
                 loc.short_label if loc else None,
-                json.dumps(loc.nearby_features if loc else []),
                 message.lens.id if message.lens else None,
                 message.lens.name if message.lens else None,
                 era,
@@ -551,15 +549,10 @@ class HearDB:
                 else:
                     loc: MessageLocation | None = None
                     if m["lat"] is not None and m["lon"] is not None and m["short_label"]:
-                        raw_features = _safe_json_loads(m["nearby_features_json"], [])
-                        features = (
-                            [str(f) for f in raw_features] if isinstance(raw_features, list) else []
-                        )
                         loc = MessageLocation(
                             lat=float(m["lat"]),
                             lon=float(m["lon"]),
                             short_label=str(m["short_label"]),
-                            nearby_features=features,
                         )
                     lens: LensSummary | None = None
                     if m["lens_id"] and m["lens_name"]:

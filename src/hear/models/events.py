@@ -26,8 +26,6 @@ class BackendEventType(StrEnum):
     CHAT_COMPLETED = "chat_completed"
     GEO_NOMINATIM_OK = "geo_nominatim_ok"
     GEO_NOMINATIM_ERROR = "geo_nominatim_error"
-    GEO_OVERPASS_OK = "geo_overpass_ok"
-    GEO_OVERPASS_ERROR = "geo_overpass_error"
     GEMINI_TEXT_ERROR = "gemini_text_error"
     GEMINI_TTS_ERROR = "gemini_tts_error"
 

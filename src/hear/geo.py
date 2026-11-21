@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import math
 import time
 from dataclasses import dataclass
@@ -40,7 +39,6 @@ class _CacheEntry:
     lat: float
     lon: float
     result: GeoContext
-    has_overpass: bool
     timestamp: float
 
 
@@ -77,20 +75,13 @@ class GeoCache:
         lat: float,
         lon: float,
         result: GeoContext,
-        has_overpass: bool,
         max_dist_m: float = 25.0,
     ) -> GeoContext:
         now = time.time()
         existing = self.find_close_entry(lat, lon, max_dist_m=max_dist_m, now=now)
         if existing is not None:
-            if existing.has_overpass and not has_overpass:
-                result = result.model_copy(
-                    update={"nearby_features": existing.result.nearby_features}
-                )
-                has_overpass = True
             # Keep existing.lat and existing.lon anchored at the originally geocoded point
             existing.result = result
-            existing.has_overpass = has_overpass
             existing.timestamp = now
             return result
 
@@ -99,7 +90,6 @@ class GeoCache:
                 lat=lat,
                 lon=lon,
                 result=result,
-                has_overpass=has_overpass,
                 timestamp=now,
             )
         )
@@ -109,7 +99,7 @@ class GeoCache:
 
 
 class GeoService:
-    """Stateful reverse-geocoding & Overpass lookup service with cache, backoff, and HTTP pool."""
+    """Stateful reverse-geocoding service with cache, backoff, and HTTP pool."""
 
     def __init__(
         self,
@@ -240,123 +230,15 @@ class GeoService:
 
         return short_label, full_address, road, neighborhood, city, ok
 
-    async def fetch_overpass(self, lat: float, lon: float) -> tuple[list[str], bool]:
-        overpass_query = f"""
-        [out:json][timeout:4];
-        (
-          node(around:150,{lat:.6f},{lon:.6f})["historic"];
-          way(around:150,{lat:.6f},{lon:.6f})["historic"];
-          node(around:150,{lat:.6f},{lon:.6f})["tourism"~"attraction|museum|artwork|viewpoint"];
-          way(around:150,{lat:.6f},{lon:.6f})["tourism"~"attraction|museum"];
-          node(around:150,{lat:.6f},{lon:.6f})["amenity"~"place_of_worship|theatre|library|townhall|marketplace|pub"];
-          way(around:150,{lat:.6f},{lon:.6f})["amenity"~"place_of_worship|theatre|library|townhall|marketplace"];
-          way(around:150,{lat:.6f},{lon:.6f})["building"]["name"];
-          node(around:150,{lat:.6f},{lon:.6f})["memorial"];
-        );
-        out tags center 15;
-        """
-        nearby_features: list[str] = []
-        ok = False
-        client = self._get_client()
-        t0 = time.monotonic()
-        try:
-            ov_resp = await client.post(
-                "https://overpass-api.de/api/interpreter",
-                data={"data": overpass_query},
-                timeout=4.5,
-            )
-            latency_ms = int((time.monotonic() - t0) * 1000)
-            if ov_resp.status_code == 200:
-                elements = ov_resp.json().get("elements", [])
-                ok = True
-                seen: set[str] = set()
-                for el in elements:
-                    tags = el.get("tags") or {}
-                    name = tags.get("name") or tags.get("historic:name") or tags.get("inscription")
-                    if not name or not isinstance(name, str) or name in seen:
-                        continue
-                    seen.add(name)
-                    kind = str(
-                        tags.get("historic")
-                        or tags.get("memorial")
-                        or tags.get("tourism")
-                        or tags.get("amenity")
-                        or tags.get("building")
-                        or "feature"
-                    )
-                    extra: list[str] = []
-                    if tags.get("start_date"):
-                        extra.append(f"built {tags['start_date']}")
-                    if tags.get("architect"):
-                        extra.append(f"architect: {tags['architect']}")
-                    if tags.get("wikipedia"):
-                        extra.append(f"wiki: {tags['wikipedia']}")
-                    suffix = f" ({kind}{', ' + ', '.join(extra) if extra else ''})"
-                    nearby_features.append(f"{name}{suffix}")
-                await self._events.log_async(
-                    BackendEventType.GEO_OVERPASS_OK,
-                    level=EventLevel.DEBUG,
-                    persist=False,
-                    latency_ms=latency_ms,
-                    feature_count=len(nearby_features),
-                )
-            else:
-                await self._events.log_async(
-                    BackendEventType.GEO_OVERPASS_ERROR,
-                    level=EventLevel.WARN,
-                    status_code=ov_resp.status_code,
-                    latency_ms=latency_ms,
-                    lat=round(lat, 5),
-                    lon=round(lon, 5),
-                )
-        except (httpx.HTTPError, ValueError) as exc:
-            latency_ms = int((time.monotonic() - t0) * 1000)
-            await self._events.log_async(
-                BackendEventType.GEO_OVERPASS_ERROR,
-                level=EventLevel.WARN,
-                error=str(exc),
-                error_type=type(exc).__name__,
-                latency_ms=latency_ms,
-                lat=round(lat, 5),
-                lon=round(lon, 5),
-            )
-        return nearby_features[:10], ok
-
-    async def reverse_geocode_and_context(
-        self, lat: float, lon: float, include_overpass: bool = True
-    ) -> GeoContext:
-        """Resolve (lat, lon) into street/neighborhood names and nearby OSM features."""
+    async def reverse_geocode(self, lat: float, lon: float) -> GeoContext:
+        """Resolve (lat, lon) into street and neighborhood names via Nominatim."""
         entry = self.cache.find_close_entry(lat, lon)
-        if entry is not None and (not include_overpass or entry.has_overpass):
+        if entry is not None:
             return entry.result
 
-        if entry is not None:
-            nearby_features, ov_ok = await self.fetch_overpass(lat, lon)
-            upgraded = entry.result.model_copy(update={"nearby_features": nearby_features})
-            if ov_ok:
-                return self.cache.set(lat, lon, upgraded, has_overpass=True)
-            return upgraded
-
-        if include_overpass:
-            (
-                (short_label, full_address, road, neighborhood, city, nom_ok),
-                (nearby_features, ov_ok),
-            ) = await asyncio.gather(
-                self.fetch_nominatim(lat, lon),
-                self.fetch_overpass(lat, lon),
-            )
-        else:
-            (
-                short_label,
-                full_address,
-                road,
-                neighborhood,
-                city,
-                nom_ok,
-            ) = await self.fetch_nominatim(lat, lon)
-            nearby_features = []
-            ov_ok = False
-
+        short_label, full_address, road, neighborhood, city, nom_ok = await self.fetch_nominatim(
+            lat, lon
+        )
         result = GeoContext(
             lat=lat,
             lon=lon,
@@ -365,8 +247,7 @@ class GeoService:
             road=road,
             neighborhood=neighborhood,
             city=city,
-            nearby_features=nearby_features,
         )
         if nom_ok:
-            return self.cache.set(lat, lon, result, has_overpass=include_overpass and ov_ok)
+            return self.cache.set(lat, lon, result)
         return result

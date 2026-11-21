@@ -9,4 +9,3 @@ class GeoContext(HearModel):
     road: str
     neighborhood: str
     city: str
-    nearby_features: list[str]

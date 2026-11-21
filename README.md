@@ -22,7 +22,7 @@ hear/
         ├── config.py        # Hot-reloading config.yaml manager
         ├── debug.py         # Build, git commit, Cloud Run revision, and runtime telemetry
         ├── gemini.py        # Gemini generateContent (with Google Search) & TTS client
-        ├── geo.py           # Haversine distance, compass bearings, Nominatim & Overpass lookups
+        ├── geo.py           # Haversine distance, compass bearings & Nominatim reverse geocoding
         ├── paths.py         # Project paths & directory initialization
         ├── session.py       # WalkSession state machine, lens sampling & trigger heuristics
         ├── models/

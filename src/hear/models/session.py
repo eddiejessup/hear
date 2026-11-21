@@ -43,7 +43,6 @@ class MessageLocation(HearModel):
     lat: float
     lon: float
     short_label: str
-    nearby_features: list[str] = Field(default_factory=list)
 
 
 class LensSummary(HearModel):

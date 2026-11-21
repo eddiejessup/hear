@@ -306,10 +306,7 @@ def create_app(
         if audio_ended_updated:
             await session.persist_last_audio_ended_at()
 
-        prefetch_overpass = session.should_prefetch_overpass(cfg, req.lat, req.lon)
-        geo = await c.geo.reverse_geocode_and_context(
-            req.lat, req.lon, include_overpass=prefetch_overpass
-        )
+        geo = await c.geo.reverse_geocode(req.lat, req.lon)
         cur_loc = CurrentLocation(
             lat=req.lat,
             lon=req.lon,
@@ -365,7 +362,7 @@ def create_app(
 
             session.is_generating = True
             try:
-                geo = await c.geo.reverse_geocode_and_context(lat, lon, include_overpass=True)
+                geo = await c.geo.reverse_geocode(lat, lon)
                 msg_record = await session.execute_narration_turn(
                     config=cfg,
                     lat=lat,
@@ -405,7 +402,7 @@ def create_app(
             try:
                 short_label: str | None = None
                 if lat is not None and lon is not None:
-                    geo = await c.geo.reverse_geocode_and_context(lat, lon, include_overpass=False)
+                    geo = await c.geo.reverse_geocode(lat, lon)
                     short_label = geo.short_label
 
                 user_msg_ui, assistant_msg_ui = await session.execute_chat_turn(

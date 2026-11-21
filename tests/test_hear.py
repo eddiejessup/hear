@@ -88,7 +88,7 @@ class TestGeoHelpers(unittest.TestCase):
         self.assertEqual(compass_bearing_label(90.0), "E (90°)")
         self.assertEqual(compass_bearing_label(225.0), "SW (225°)")
 
-    def test_geo_cache_upgrade_and_ttl(self) -> None:
+    def test_geo_cache_anchor_lru_and_ttl(self) -> None:
         cache = GeoCache(max_entries=2, ttl_seconds=60.0)
         base_ctx = GeoContext(
             lat=51.5142,
@@ -98,36 +98,59 @@ class TestGeoHelpers(unittest.TestCase):
             road="Cornhill",
             neighborhood="City of London",
             city="London",
-            nearby_features=[],
         )
-        cache.set(51.5142, -0.0885, base_ctx, has_overpass=False)
+        cache.set(51.5142, -0.0885, base_ctx)
 
-        # Within 25m without overpass -> cache hit with has_overpass=False
+        # Within 25m -> cache hit
         entry = cache.find_close_entry(51.51425, -0.0885)
         self.assertIsNotNone(entry)
         assert entry is not None
-        self.assertFalse(entry.has_overpass)
+        self.assertEqual(entry.result.short_label, "Cornhill, City of London")
 
-        # Upgrade with overpass features preserves original geocoded anchor coordinates
-        upgraded_ctx = base_ctx.model_copy(update={"nearby_features": ["Royal Exchange"]})
-        cache.set(51.51425, -0.0885, upgraded_ctx, has_overpass=True)
+        # Updating within 25m preserves original geocoded anchor coordinates
+        updated_ctx = base_ctx.model_copy(update={"short_label": "1 Cornhill, City of London"})
+        cache.set(51.51425, -0.0885, updated_ctx)
         entry = cache.find_close_entry(51.5142, -0.0885)
         self.assertIsNotNone(entry)
         assert entry is not None
-        self.assertTrue(entry.has_overpass)
         self.assertAlmostEqual(entry.lat, 51.5142)
-        self.assertEqual(entry.result.nearby_features, ["Royal Exchange"])
+        self.assertEqual(entry.result.short_label, "1 Cornhill, City of London")
 
         # Add a second entry far away, then touch the first entry so it becomes MRU
         other_ctx = base_ctx.model_copy(update={"lat": 51.5200, "short_label": "Moorgate"})
-        cache.set(51.5200, -0.0885, other_ctx, has_overpass=True)
+        cache.set(51.5200, -0.0885, other_ctx)
         self.assertIsNotNone(cache.find_close_entry(51.5142, -0.0885))
 
         # Adding a third entry evicts the LRU (51.5200) and keeps the MRU (51.5142)
         third_ctx = base_ctx.model_copy(update={"lat": 51.5300, "short_label": "Angel"})
-        cache.set(51.5300, -0.0885, third_ctx, has_overpass=True)
+        cache.set(51.5300, -0.0885, third_ctx)
         self.assertIsNotNone(cache.find_close_entry(51.5142, -0.0885))
         self.assertIsNone(cache.find_close_entry(51.5200, -0.0885))
+
+    def test_reverse_geocode_caches_nominatim_result(self) -> None:
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.get.return_value = httpx.Response(
+            200,
+            json={
+                "display_name": "3 ter, Rue des Rosiers, Quartier Saint-Gervais, Paris",
+                "address": {
+                    "house_number": "3 ter",
+                    "road": "Rue des Rosiers",
+                    "quarter": "Quartier Saint-Gervais",
+                    "city": "Paris",
+                },
+            },
+        )
+        geo = GeoService(http_client=mock_client)
+
+        ctx1 = asyncio.run(geo.reverse_geocode(48.8566, 2.3604))
+        self.assertEqual(ctx1.short_label, "3 ter Rue des Rosiers, Quartier Saint-Gervais, Paris")
+        self.assertEqual(mock_client.get.call_count, 1)
+
+        # Nearby coordinate within 25m reuses cached result without another HTTP call
+        ctx2 = asyncio.run(geo.reverse_geocode(48.85665, 2.3604))
+        self.assertEqual(ctx2.short_label, ctx1.short_label)
+        self.assertEqual(mock_client.get.call_count, 1)
 
     def test_nominatim_failure_backoff(self) -> None:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
@@ -178,7 +201,7 @@ class TestWalkSession(unittest.TestCase):
         self.assertIn(third.id, {"econ", "pol"})
         self.assertEqual(len(session.used_lens_ids), 1)
 
-    def test_trigger_heuristics_and_prefetch(self) -> None:
+    def test_trigger_heuristics(self) -> None:
         session = WalkSession("test")
         # No location yet -> should not trigger
         status = session.compute_trigger_status(self.config)
@@ -196,7 +219,6 @@ class TestWalkSession(unittest.TestCase):
         status = session.compute_trigger_status(self.config)
         self.assertTrue(status.should_trigger)
         self.assertEqual(status.trigger_reason, "initial_location")
-        self.assertTrue(session.should_prefetch_overpass(self.config, 51.5142, -0.0885))
 
         # After triggering at Start, cooldown blocks immediate re-trigger
         session.last_trigger_location = TriggerLocation(
@@ -214,8 +236,6 @@ class TestWalkSession(unittest.TestCase):
         status_cooldown = session.compute_trigger_status(self.config)
         self.assertFalse(status_cooldown.should_trigger)
         self.assertGreater(status_cooldown.cooldown_remaining_s, 0)
-        # But distance is >75% of 120m, so overpass prefetch should activate
-        self.assertTrue(session.should_prefetch_overpass(self.config, 51.5156, -0.0885))
 
         # Once cooldown expires (100s ago) and moved >= 120m -> distance trigger
         session.last_audio_ended_at = now - 100.0
@@ -711,7 +731,6 @@ class TestAudioPruningAndAuth(unittest.TestCase):
                 road="Achilles Road",
                 neighborhood="West Hampstead",
                 city="London",
-                nearby_features=[],
             )
             asyncio.run(sess.execute_narration_turn(cfg, 51.5531, -0.1977, None, geo))
             asyncio.run(
@@ -771,7 +790,6 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
                 road="Cornhill",
                 neighborhood="City of London",
                 city="London",
-                nearby_features=["Royal Exchange"],
             )
             fake_gemini = _FakeGeminiClient(
                 [
@@ -956,7 +974,6 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
                 road="Cornhill",
                 neighborhood="City",
                 city="London",
-                nearby_features=[],
             )
             fake_present = _FakeGeminiClient(
                 [GeminiTextResult(text="One", search_queries=[], sources=[])],
@@ -1071,7 +1088,6 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
                 road="Cornhill",
                 neighborhood="City",
                 city="London",
-                nearby_features=[],
             )
             fake_gemini = _FakeGeminiClient(
                 [GeminiTextResult(text="Hi", search_queries=[], sources=[])],

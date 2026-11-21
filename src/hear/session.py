@@ -411,26 +411,6 @@ class WalkSession:
             is_paused_audio=pause_hold_active,
         )
 
-    def should_prefetch_overpass(self, config: AppConfig, lat: float, lon: float) -> bool:
-        """Return True if the user is approaching a narration trigger (>75% of min_distance)."""
-        trig = config.triggers
-        if (
-            not trig.auto_trigger_enabled
-            or self.is_generating
-            or self.is_playing_audio
-            or self.is_pause_hold_active(time.time())
-        ):
-            return False
-        if self.last_trigger_location is None:
-            return True
-        dist_m = haversine_meters(
-            lat,
-            lon,
-            self.last_trigger_location.lat,
-            self.last_trigger_location.lon,
-        )
-        return dist_m >= 0.75 * trig.min_distance_meters
-
     @staticmethod
     def build_narration_prompt(
         lat: float,
@@ -441,11 +421,6 @@ class WalkSession:
         custom_focus: str | None = None,
     ) -> str:
         compass = compass_bearing_label(heading)
-        nearby_str = (
-            "\nNearby mapped features (within 150m): " + "; ".join(geo.nearby_features)
-            if geo.nearby_features
-            else ""
-        )
         heading_str = f" | Heading: {compass}" if compass else ""
         focus_str = (
             f"\nAdditional user request for this stop: {custom_focus}" if custom_focus else ""
@@ -453,8 +428,7 @@ class WalkSession:
         return (
             f"[LOCATION TRIGGER — {geo.short_label}]\n"
             f"Coordinates: {lat:.5f}, {lon:.5f}{heading_str}\n"
-            f"Full address context: {geo.full_address}"
-            f"{nearby_str}\n\n"
+            f"Full address context: {geo.full_address}\n\n"
             f"Selected Lens ({lens.name}): {lens.prompt}"
             f"{focus_str}\n\n"
             "Narrate an insightful historical segment about this location "
@@ -500,7 +474,6 @@ class WalkSession:
                 lat=lat,
                 lon=lon,
                 short_label=geo.short_label,
-                nearby_features=geo.nearby_features,
             ),
             lens=LensSummary(id=lens.id, name=lens.name),
             reason=reason,
