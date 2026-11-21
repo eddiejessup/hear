@@ -192,15 +192,28 @@ function renderStateUI() {
     if (appState.playback.lastError) {
       items.push(["Audio Error", appState.playback.lastError]);
     }
-    panel.innerHTML = items
-      .map(
-        ([label, val]) => `
-        <div class="state-item">
+    const canPatchInPlace =
+      panel.childElementCount === items.length &&
+      items.every(([label], idx) => panel.children[idx]?.dataset.label === label);
+    if (canPatchInPlace) {
+      items.forEach(([, val], idx) => {
+        const valEl = panel.children[idx].querySelector(".state-item-value");
+        if (valEl && valEl.textContent !== val) {
+          valEl.textContent = val;
+          valEl.title = val;
+        }
+      });
+    } else {
+      panel.innerHTML = items
+        .map(
+          ([label, val]) => `
+        <div class="state-item" data-label="${escapeHtml(label)}">
           <span class="state-item-label">${escapeHtml(label)}</span>
           <span class="state-item-value" title="${escapeHtml(val)}">${escapeHtml(val)}</span>
         </div>`
-      )
-      .join("");
+        )
+        .join("");
+    }
   }
 }
 
@@ -214,8 +227,9 @@ function bindDomEvents() {
   document.getElementById("openSimBtn").addEventListener("click", drawers.openSimDrawer);
   document.getElementById("openConfigBtn").addEventListener("click", drawers.openConfigDrawer);
 
-  document.getElementById("statusGateBadge").addEventListener("click", () => {
-    document.getElementById("stateInspectorPanel").classList.toggle("open");
+  document.getElementById("statusGateBadge").addEventListener("click", (event) => {
+    const isOpen = document.getElementById("stateInspectorPanel").classList.toggle("open");
+    event.currentTarget.setAttribute("aria-expanded", String(isOpen));
     renderStateUI();
   });
 
@@ -307,7 +321,9 @@ async function init() {
   setInterval(periodicPing, 6000);
   setInterval(() => {
     telemetry.checkGpsStaleness();
-    renderStateUI();
+    if (document.visibilityState !== "hidden") {
+      renderStateUI();
+    }
   }, 1000);
 }
 
@@ -361,7 +377,10 @@ async function fetchInitialState() {
     console.error("Failed to load initial state:", err);
     patchSection(
       "network",
-      { status: NetworkState.ERROR, lastError: err?.message || "init_failed" },
+      {
+        status: navigator.onLine === false ? NetworkState.OFFLINE : NetworkState.ERROR,
+        lastError: err?.message || "init_failed",
+      },
       "state_error"
     );
     telemetry.track(
@@ -426,6 +445,8 @@ function startGpsWatch() {
 async function periodicPing() {
   const coords = appState.gps.coords;
   if (!coords || isGenerating()) return;
+  const gpsStatus = getEffectiveGpsStatus(appState);
+  if (gpsStatus !== GpsState.ACTIVE && gpsStatus !== GpsState.SIMULATED) return;
   const autoEnabled = appState.currentConfig?.triggers?.auto_trigger_enabled ?? false;
   const playing = isPlayingAudio();
   const paused = isPausedAudio();
@@ -503,7 +524,9 @@ async function sendPing(audioJustEnded = false) {
     );
     patchSection("trigger", { status: data.trigger_status, updatedAt: nowMs }, "ping_ok");
 
-    if (data.trigger_status?.should_trigger && !isGenerating() && !isPlayingAudio()) {
+    const liveGpsStatus = getEffectiveGpsStatus(appState, nowMs);
+    const gpsReady = liveGpsStatus === GpsState.ACTIVE || liveGpsStatus === GpsState.SIMULATED;
+    if (data.trigger_status?.should_trigger && gpsReady && !isGenerating() && !isPlayingAudio()) {
       triggerNarration(data.trigger_status.trigger_reason || "auto");
     }
   } catch (err) {
@@ -568,7 +591,7 @@ async function triggerNarration(reason = "manual") {
       }),
     });
 
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       if (res.status !== 409) {
         patchSection(
@@ -601,7 +624,10 @@ async function triggerNarration(reason = "manual") {
   } catch (err) {
     patchSection(
       "network",
-      { status: NetworkState.ERROR, lastError: err?.message || "network_error" },
+      {
+        status: navigator.onLine === false ? NetworkState.OFFLINE : NetworkState.ERROR,
+        lastError: err?.message || "network_error",
+      },
       "narration_error"
     );
     telemetry.track(
@@ -657,7 +683,7 @@ async function sendChat(event) {
         lon: appState.gps.coords?.lon ?? null,
       }),
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       userCard?.remove();
       input.value = text;
@@ -694,7 +720,10 @@ async function sendChat(event) {
     input.value = text;
     patchSection(
       "network",
-      { status: NetworkState.ERROR, lastError: err?.message || "network_error" },
+      {
+        status: navigator.onLine === false ? NetworkState.OFFLINE : NetworkState.ERROR,
+        lastError: err?.message || "network_error",
+      },
       "chat_error"
     );
     telemetry.track(
@@ -817,11 +846,22 @@ function addSystemBanner(text) {
 // ---------------------------------------------------------------------------
 // Pocket Mode (WakeLock + Pure-Black OLED Overlay)
 // ---------------------------------------------------------------------------
+let wakeLockRequestInFlight = false;
+
 async function requestScreenWakeLock() {
   if (!("wakeLock" in navigator)) return;
-  if (appState.device.wakeLockSentinel) return;
+  if (appState.device.wakeLockSentinel || wakeLockRequestInFlight) return;
+  wakeLockRequestInFlight = true;
   try {
     const sentinel = await navigator.wakeLock.request("screen");
+    if (!appState.device.pocketMode) {
+      try {
+        await sentinel.release();
+      } catch (_e) {
+        // Ignore already-released WakeLock errors
+      }
+      return;
+    }
     sentinel.addEventListener("release", () => {
       if (appState.device.wakeLockSentinel === sentinel) {
         patchSection(
@@ -843,6 +883,8 @@ async function requestScreenWakeLock() {
       { wakeLock: WakeLockState.ERROR, wakeLockError: e?.message || "wakelock_failed" },
       "wakelock_error"
     );
+  } finally {
+    wakeLockRequestInFlight = false;
   }
 }
 
@@ -863,11 +905,13 @@ async function exitPocketMode() {
     } catch (_e) {
       // Ignore already-released WakeLock errors
     }
-    patchSection(
-      "device",
-      { wakeLock: WakeLockState.OFF, wakeLockSentinel: null },
-      "wakelock_released"
-    );
+    if (appState.device.wakeLockSentinel === sentinel) {
+      patchSection(
+        "device",
+        { wakeLock: WakeLockState.OFF, wakeLockSentinel: null },
+        "wakelock_released"
+      );
+    }
   }
 }
 

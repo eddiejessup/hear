@@ -166,16 +166,20 @@ export function computeTriggerGate(state = appState, nowMs = Date.now()) {
   if (isPlayingAudio(state)) {
     return { code: "playing", label: "Playing audio", tone: "active" };
   }
-  if (isPausedAudio(state) || state.trigger.status?.is_paused_audio) {
+  const serverAckedPause = state.network.lastPingSnapshot?.isPausedAudio === true;
+  const pauseHold = serverAckedPause
+    ? Boolean(state.trigger.status?.is_paused_audio)
+    : isPausedAudio(state) || Boolean(state.trigger.status?.is_paused_audio);
+  if (pauseHold) {
     return { code: "paused_hold", label: "Paused (holding)", tone: "warn" };
   }
 
   const gpsStatus = getEffectiveGpsStatus(state, nowMs);
-  if (!state.gps.coords || gpsStatus === GpsState.WAITING) {
-    return { code: "no_gps", label: "Waiting for GPS", tone: "warn" };
-  }
   if (gpsStatus === GpsState.UNSUPPORTED || gpsStatus === GpsState.ERROR) {
     return { code: "gps_error", label: "GPS unavailable", tone: "error" };
+  }
+  if (!state.gps.coords || gpsStatus === GpsState.WAITING) {
+    return { code: "no_gps", label: "Waiting for GPS", tone: "warn" };
   }
   if (gpsStatus === GpsState.STALE) {
     const staleS = Math.floor((nowMs - state.gps.lastFixAt) / 1000);

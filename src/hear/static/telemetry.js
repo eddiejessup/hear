@@ -97,6 +97,7 @@ export function createTelemetryClient({
 
   async function flush({ useBeacon = false } = {}) {
     if (buffer.length === 0) return 0;
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return 0;
     if (useBeacon) {
       const batch = buffer.splice(0, MAX_BUFFER_SIZE);
       const body = JSON.stringify({ events: batch });
@@ -118,13 +119,27 @@ export function createTelemetryClient({
       }
       if (fetchFn) {
         try {
-          fetchFn(endpoint, {
+          const pending = fetchFn(endpoint, {
             method: "POST",
             headers: buildHeaders(),
             body,
             keepalive: true,
-          }).catch(() => {});
-          totalSent += batch.length;
+          });
+          if (pending && typeof pending.then === "function") {
+            pending
+              .then((res) => {
+                if (res?.ok) {
+                  totalSent += batch.length;
+                } else if (!res || res.status >= 500 || res.status === 429) {
+                  requeueFront(batch);
+                } else {
+                  totalDropped += batch.length;
+                }
+              })
+              .catch(() => {
+                requeueFront(batch);
+              });
+          }
           return batch.length;
         } catch (_e) {
           // Re-queue if unload dispatch fails synchronously
@@ -135,7 +150,6 @@ export function createTelemetryClient({
     }
 
     if (flushInFlight || !fetchFn) return 0;
-    if (typeof navigator !== "undefined" && navigator.onLine === false) return 0;
 
     flushInFlight = true;
     const batch = buffer.splice(0, MAX_BUFFER_SIZE);

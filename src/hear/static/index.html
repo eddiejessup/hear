@@ -33,10 +33,10 @@
       <div class="telemetry-row">
         <span id="gpsStatusBadge" class="badge">GPS: waiting</span>
         <span id="distBadge" class="badge">Moved: 0m / 120m</span>
-        <button type="button" id="statusGateBadge" class="badge clickable" title="Tap to toggle live state inspector">Waiting for GPS</button>
+        <button type="button" id="statusGateBadge" class="badge clickable" aria-expanded="false" aria-controls="stateInspectorPanel" title="Tap to toggle live state inspector">Waiting for GPS</button>
         <span id="syncBadge" class="badge">Sync: --</span>
       </div>
-      <div id="stateInspectorPanel" class="state-panel" aria-live="polite"></div>
+      <div id="stateInspectorPanel" class="state-panel"></div>
     </div>
   </header>
 

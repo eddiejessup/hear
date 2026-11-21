@@ -418,6 +418,24 @@ class TestAudioPruningAndAuth(unittest.TestCase):
         html = (static_dir / "index.html").read_text(encoding="utf-8")
         html_ids = set(re.findall(r'\bid="([^"]+)"', html))
 
+        exports_by_file: dict[Path, set[str]] = {}
+        for js_file in sorted(static_dir.glob("*.js")):
+            src = js_file.read_text(encoding="utf-8")
+            exported = set(
+                re.findall(
+                    r"\bexport\s+(?:async\s+)?(?:function|const|let|var|class)\s+([A-Za-z_$][\w$]*)",
+                    src,
+                )
+            )
+            for block in re.findall(r"\bexport\s*\{([^}]+)\}", src):
+                for item in block.split(","):
+                    cleaned = item.strip()
+                    if not cleaned:
+                        continue
+                    parts = re.split(r"\s+as\s+", cleaned)
+                    exported.add(parts[-1].strip())
+            exports_by_file[js_file.resolve()] = exported
+
         for js_file in sorted(static_dir.glob("*.js")):
             src = js_file.read_text(encoding="utf-8")
             for rel_import in re.findall(r'from\s+["\'](\.[^"\']+)["\']', src):
@@ -426,6 +444,23 @@ class TestAudioPruningAndAuth(unittest.TestCase):
                     target.is_file(),
                     f"Broken relative JS import '{rel_import}' in {js_file.name}",
                 )
+            for names_block, rel_import in re.findall(
+                r'import\s*\{([^}]+)\}\s*from\s*["\'](\.[^"\']+)["\']',
+                src,
+            ):
+                target = (js_file.parent / rel_import).resolve()
+                target_exports = exports_by_file.get(target, set())
+                for item in names_block.split(","):
+                    cleaned = item.strip()
+                    if not cleaned:
+                        continue
+                    imported_name = re.split(r"\s+as\s+", cleaned)[0].strip()
+                    self.assertIn(
+                        imported_name,
+                        target_exports,
+                        f"Missing export '{imported_name}' in {target.name} "
+                        f"(imported by {js_file.name})",
+                    )
             for dom_id in re.findall(r'getElementById\(\s*["\']([^"\']+)["\']\s*\)', src):
                 self.assertIn(
                     dom_id,

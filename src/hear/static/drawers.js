@@ -118,7 +118,13 @@ export function createDrawersController({
   function resumeRealGps() {
     patchSection(
       "gps",
-      { simulated: false, status: GpsState.WAITING, lastError: null },
+      {
+        simulated: false,
+        status: GpsState.WAITING,
+        coords: null,
+        lastFixAt: null,
+        lastError: null,
+      },
       "gps_real"
     );
     closeSimDrawer();

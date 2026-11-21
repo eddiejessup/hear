@@ -11,7 +11,9 @@ export function createAudioController({
   onKeepAliveError = () => {},
 }) {
   let keepAliveAudio = null;
+  let keepAliveStarting = false;
   let activeSpeechUtterance = null;
+  let playRequestId = 0;
 
   function setupAudioEvents() {
     mainAudio.addEventListener("play", () => {
@@ -43,6 +45,7 @@ export function createAudioController({
   }
 
   function playAudioUrl(url, title, subtitle) {
+    const reqId = ++playRequestId;
     audioBar.classList.add("visible");
     mainAudio.src = url;
     mainAudio.playbackRate = state.playback.speeds[state.playback.speedIdx];
@@ -52,6 +55,7 @@ export function createAudioController({
       "audio_load"
     );
     mainAudio.play().catch((e) => {
+      if (reqId !== playRequestId || e?.name === "AbortError") return;
       console.warn("Audio play blocked until user gesture:", e);
       patchSection(
         "playback",
@@ -114,7 +118,11 @@ export function createAudioController({
     if (!("mediaSession" in navigator)) return;
     navigator.mediaSession.setActionHandler("play", () => {
       onMediaSessionAction("play");
-      mainAudio.play();
+      if (!mainAudio.src) return;
+      mainAudio.play().catch((e) => {
+        if (e?.name === "AbortError") return;
+        console.warn("MediaSession play failed:", e);
+      });
     });
     navigator.mediaSession.setActionHandler("pause", () => {
       onMediaSessionAction("pause");
@@ -129,7 +137,10 @@ export function createAudioController({
       onMediaSessionAction("previoustrack");
       if (mainAudio.src) {
         mainAudio.currentTime = 0;
-        mainAudio.play();
+        mainAudio.play().catch((e) => {
+          if (e?.name === "AbortError") return;
+          console.warn("MediaSession replay failed:", e);
+        });
       }
     });
   }
@@ -137,48 +148,56 @@ export function createAudioController({
   // Plays an ultra-quiet generated WAV loop so Android Chrome keeps the MediaSession
   // and background tab alive even during silent walking intervals between narrations.
   function ensureSilentKeepAlive() {
-    if (keepAliveAudio) return;
+    if (state.playback.keepAliveActive || keepAliveStarting) return;
     try {
-      const sampleRate = 8000;
-      const numSamples = sampleRate; // 1 second
-      const buffer = new ArrayBuffer(44 + numSamples * 2);
-      const view = new DataView(buffer);
-      const writeStr = (offset, str) => {
-        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-      };
-      writeStr(0, "RIFF");
-      view.setUint32(4, 36 + numSamples * 2, true);
-      writeStr(8, "WAVE");
-      writeStr(12, "fmt ");
-      view.setUint32(16, 16, true);
-      view.setUint16(20, 1, true);
-      view.setUint16(22, 1, true);
-      view.setUint32(24, sampleRate, true);
-      view.setUint32(28, sampleRate * 2, true);
-      view.setUint16(32, 2, true);
-      view.setUint16(34, 16, true);
-      writeStr(36, "data");
-      view.setUint32(40, numSamples * 2, true);
+      if (!keepAliveAudio) {
+        const sampleRate = 8000;
+        const numSamples = sampleRate; // 1 second
+        const buffer = new ArrayBuffer(44 + numSamples * 2);
+        const view = new DataView(buffer);
+        const writeStr = (offset, str) => {
+          for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+        };
+        writeStr(0, "RIFF");
+        view.setUint32(4, 36 + numSamples * 2, true);
+        writeStr(8, "WAVE");
+        writeStr(12, "fmt ");
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, 1, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * 2, true);
+        view.setUint16(32, 2, true);
+        view.setUint16(34, 16, true);
+        writeStr(36, "data");
+        view.setUint32(40, numSamples * 2, true);
 
-      const blob = new Blob([buffer], { type: "audio/wav" });
-      keepAliveAudio = new Audio(URL.createObjectURL(blob));
-      keepAliveAudio.loop = true;
-      keepAliveAudio.volume = 0.01;
+        const blob = new Blob([buffer], { type: "audio/wav" });
+        keepAliveAudio = new Audio(URL.createObjectURL(blob));
+        keepAliveAudio.loop = true;
+        keepAliveAudio.volume = 0.01;
+      }
+      keepAliveStarting = true;
       keepAliveAudio
         .play()
         .then(() => {
+          keepAliveStarting = false;
           patchSection("playback", { keepAliveActive: true }, "keepalive_started");
         })
         .catch((err) => {
+          keepAliveStarting = false;
           onKeepAliveError(err?.name || err?.message || "play_rejected");
         });
     } catch (e) {
+      keepAliveStarting = false;
+      keepAliveAudio = null;
       console.warn("Silent keep-alive init failed:", e);
       onKeepAliveError(e?.message || "init_failed");
     }
   }
 
   function stopAndReset() {
+    playRequestId += 1;
     mainAudio.pause();
     mainAudio.removeAttribute("src");
     mainAudio.load();
