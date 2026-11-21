@@ -131,7 +131,11 @@ export function createDrawersController({
     startGpsWatch();
   }
 
-  async function resetSession() {
+  async function startNewWalk() {
+    const hasMessages = document.querySelectorAll("#feed .msg-card").length > 0;
+    if (hasMessages && !confirm("Start a new walk? Your current walk remains saved in history.")) {
+      return;
+    }
     const res = await apiFetch("/api/session/reset", { method: "POST" });
     if (res.ok) {
       const data = await res.json();
@@ -144,7 +148,7 @@ export function createDrawersController({
         "session_reset"
       );
       document.getElementById("feed").innerHTML =
-        `<div id="emptyState" class="empty-state">New walk session started.</div>`;
+        `<div id="emptyState" class="empty-state">New walk started. Previous walk saved in history.</div>`;
       closeSimDrawer();
     }
   }
@@ -327,7 +331,7 @@ export function createDrawersController({
     applySimCoords,
     nudgeSim,
     resumeRealGps,
-    resetSession,
+    startNewWalk,
     toggleAutoTrigger,
     openConfigDrawer,
     closeConfigDrawer,

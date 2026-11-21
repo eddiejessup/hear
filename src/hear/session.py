@@ -527,6 +527,7 @@ class WalkSession:
                 llm_latency_ms=llm_latency_ms,
                 tts_latency_ms=tts_latency_ms,
             )
+        usage_payload = llm_result.usage.model_dump(exclude_none=True) if llm_result.usage else {}
         await self._events.log_async(
             BackendEventType.NARRATION_COMPLETED,
             session_id=self.session_id,
@@ -536,6 +537,7 @@ class WalkSession:
             reason=reason,
             lens_id=lens.id,
             model=config.gemini.model,
+            thinking_level=config.gemini.thinking_level,
             short_label=geo.short_label,
             lat=round(lat, 5),
             lon=round(lon, 5),
@@ -545,6 +547,7 @@ class WalkSession:
             search_query_count=len(llm_result.search_queries),
             llm_latency_ms=llm_latency_ms,
             tts_latency_ms=tts_latency_ms,
+            **usage_payload,
         )
         return msg_record
 
@@ -608,6 +611,7 @@ class WalkSession:
                 llm_latency_ms=llm_latency_ms,
                 tts_latency_ms=tts_latency_ms,
             )
+        usage_payload = llm_result.usage.model_dump(exclude_none=True) if llm_result.usage else {}
         await self._events.log_async(
             BackendEventType.CHAT_COMPLETED,
             session_id=self.session_id,
@@ -615,11 +619,15 @@ class WalkSession:
             persist=self._store is not None,
             message_id=assistant_msg_ui.id,
             model=config.gemini.model,
+            thinking_level=config.gemini.thinking_level,
             short_label=short_label,
             word_count=len(llm_result.text.split()),
             has_audio=audio_url is not None,
+            source_count=len(llm_result.sources),
+            search_query_count=len(llm_result.search_queries),
             llm_latency_ms=llm_latency_ms,
             tts_latency_ms=tts_latency_ms,
+            **usage_payload,
         )
         return user_msg_ui, assistant_msg_ui
 

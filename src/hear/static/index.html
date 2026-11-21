@@ -19,12 +19,13 @@
         <span id="versionBadge" class="badge" style="font-size: 0.7rem; color: var(--muted); cursor: pointer;" title="Build &amp; Runtime Info">--</span>
       </div>
       <div class="top-actions">
-        <button id="autoToggleBtn" class="icon-btn active">Auto: ON</button>
-        <button id="pocketBtn" class="icon-btn" title="Black out screen for pocket while keeping GPS &amp; WakeLock active">
-          Pocket Lock
+        <button type="button" id="autoToggleBtn" class="icon-btn active">Auto: ON</button>
+        <button type="button" id="newWalkBtn" class="icon-btn" title="Archive current walk in history and start a fresh session">New Walk</button>
+        <button type="button" id="pocketBtn" class="icon-btn" title="Black out screen for pocket while keeping GPS &amp; WakeLock active">
+          Pocket
         </button>
-        <button id="openSimBtn" class="icon-btn">Sim</button>
-        <button id="openConfigBtn" class="icon-btn">Config</button>
+        <button type="button" id="openSimBtn" class="icon-btn">Sim</button>
+        <button type="button" id="openConfigBtn" class="icon-btn">Config</button>
       </div>
     </div>
 
@@ -127,9 +128,9 @@
         <button id="resumeGpsBtn" class="icon-btn">Use Real Phone GPS</button>
       </div>
       <hr style="border: none; border-top: 1px solid var(--border); width: 100%;" />
-      <div style="display: flex; justify-content: space-between; align-items: center;">
-        <span style="font-size: 0.85rem; color: var(--muted);">Clear current walk memory &amp; start fresh</span>
-        <button id="resetSessionBtn" class="icon-btn" style="border-color: var(--red); color: #fca5a5;">Reset Walk Session</button>
+      <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px;">
+        <span style="font-size: 0.85rem; color: var(--muted);">Archive current walk in history &amp; start a fresh session</span>
+        <button type="button" id="simNewWalkBtn" class="icon-btn">New Walk</button>
       </div>
       <hr style="border: none; border-top: 1px solid var(--border); width: 100%;" />
       <div class="field-group">

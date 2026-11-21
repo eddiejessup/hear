@@ -17,7 +17,7 @@ from fastapi import HTTPException
 from hear.auth import EnvReader
 from hear.logging_utils import EventLogger
 from hear.models.events import BackendEventType, EventLevel
-from hear.models.gemini import GeminiContent, GeminiTextResult, GroundingSource
+from hear.models.gemini import GeminiContent, GeminiTextResult, GeminiUsage, GroundingSource
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,29 @@ def pcm_to_wav_bytes(
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_bytes)
     return buf.getvalue()
+
+
+def _int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _parse_usage_metadata(data: dict[str, Any]) -> GeminiUsage | None:
+    raw = data.get("usageMetadata")
+    if not isinstance(raw, dict):
+        return None
+    usage = GeminiUsage(
+        prompt_tokens=_int_or_none(raw.get("promptTokenCount")),
+        output_tokens=_int_or_none(raw.get("candidatesTokenCount")),
+        thought_tokens=_int_or_none(raw.get("thoughtsTokenCount")),
+        cached_tokens=_int_or_none(raw.get("cachedContentTokenCount")),
+        tool_use_prompt_tokens=_int_or_none(raw.get("toolUsePromptTokenCount")),
+        total_tokens=_int_or_none(raw.get("totalTokenCount")),
+    )
+    if not usage.model_dump(exclude_none=True):
+        return None
+    return usage
 
 
 def _write_and_prune_wav(audio_dir: Path, wav_path: Path, wav_bytes: bytes) -> None:
@@ -282,6 +305,7 @@ class GeminiClient:
             text=full_text,
             search_queries=search_queries,
             sources=sources[:6],
+            usage=_parse_usage_metadata(data),
         )
 
     async def generate_tts(

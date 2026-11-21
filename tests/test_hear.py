@@ -24,7 +24,13 @@ from hear.geo import GeoCache, GeoService, compass_bearing_label, haversine_mete
 from hear.logging_utils import EventLogger, bind_event_context, set_event_session_id
 from hear.models.config import AppConfig, GeminiConfig, LensConfig, TriggersConfig
 from hear.models.events import BackendEventType, EventLevel, EventSource
-from hear.models.gemini import GeminiContent, GeminiPart, GeminiTextResult, GroundingSource
+from hear.models.gemini import (
+    GeminiContent,
+    GeminiPart,
+    GeminiTextResult,
+    GeminiUsage,
+    GroundingSource,
+)
 from hear.models.geo import GeoContext
 from hear.models.session import CurrentLocation, TriggerLocation
 from hear.paths import PROJECT_ROOT, AppPaths, resolve_data_dir
@@ -599,6 +605,141 @@ class TestAudioPruningAndAuth(unittest.TestCase):
         self.assertEqual(len(fake_gemini.text_calls), 1)
         self.assertEqual(fake_gemini.text_calls[0]["model"], "gemini-4-hydrogen")
         self.assertEqual(fake_gemini.text_calls[0]["thinking_level"], "high")
+
+    def test_gemini_usage_metadata_parsed_and_logged_on_completion_events(self) -> None:
+        resp_with_usage = httpx.Response(
+            200,
+            json={
+                "candidates": [{"content": {"parts": [{"text": "Historical note."}]}}],
+                "usageMetadata": {
+                    "promptTokenCount": 4200,
+                    "candidatesTokenCount": 310,
+                    "thoughtsTokenCount": 680,
+                    "cachedContentTokenCount": 3900,
+                    "toolUsePromptTokenCount": 950,
+                    "totalTokenCount": 6140,
+                },
+            },
+        )
+        resp_without_usage = httpx.Response(
+            200,
+            json={"candidates": [{"content": {"parts": [{"text": "No usage."}]}}]},
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.post.side_effect = [resp_with_usage, resp_without_usage]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gemini = GeminiClient(
+                audio_dir=Path(tmpdir),
+                api_key="fake-key",
+                http_client=mock_http,
+            )
+            res1 = asyncio.run(
+                gemini.generate_text(
+                    contents=[GeminiContent(role="user", parts=[GeminiPart(text="Hello")])],
+                    system_prompt="System",
+                    model="gemini-4-hydrogen",
+                    thinking_level="medium",
+                )
+            )
+            self.assertEqual(
+                res1.usage,
+                GeminiUsage(
+                    prompt_tokens=4200,
+                    output_tokens=310,
+                    thought_tokens=680,
+                    cached_tokens=3900,
+                    tool_use_prompt_tokens=950,
+                    total_tokens=6140,
+                ),
+            )
+
+            res2 = asyncio.run(
+                gemini.generate_text(
+                    contents=[GeminiContent(role="user", parts=[GeminiPart(text="Hello")])],
+                    system_prompt="System",
+                    model="gemini-4-hydrogen",
+                )
+            )
+            self.assertIsNone(res2.usage)
+
+            store = HearDB(Path(tmpdir) / "hear.db")
+            store.init()
+            fake_gemini = _FakeGeminiClient(
+                [
+                    GeminiTextResult(
+                        text="Narration text.",
+                        search_queries=["q1"],
+                        sources=[GroundingSource(title="BHO", uri="https://example.com")],
+                        usage=GeminiUsage(
+                            prompt_tokens=1200,
+                            output_tokens=250,
+                            thought_tokens=500,
+                            cached_tokens=0,
+                            total_tokens=1950,
+                        ),
+                    ),
+                    GeminiTextResult(
+                        text="Chat reply.",
+                        search_queries=["q2", "q3"],
+                        sources=[],
+                        usage=GeminiUsage(
+                            prompt_tokens=5000,
+                            output_tokens=180,
+                            thought_tokens=320,
+                            cached_tokens=4100,
+                            total_tokens=5500,
+                        ),
+                    ),
+                ]
+            )
+            sess = WalkSession(client_id="elmo", store=store, gemini=fake_gemini)
+            sess.reset()
+            cfg = AppConfig(
+                gemini=GeminiConfig(
+                    model="gemini-4-hydrogen",
+                    thinking_level="medium",
+                    tts_enabled=False,
+                ),
+                lenses=[LensConfig(id="econ", name="Econ", enabled=True, prompt="Econ")],
+            )
+            geo = GeoContext(
+                lat=51.5531,
+                lon=-0.1977,
+                short_label="Achilles Road, West Hampstead",
+                full_address="Achilles Road, London",
+                road="Achilles Road",
+                neighborhood="West Hampstead",
+                city="London",
+                nearby_features=[],
+            )
+            asyncio.run(sess.execute_narration_turn(cfg, 51.5531, -0.1977, None, geo))
+            asyncio.run(
+                sess.execute_chat_turn(
+                    cfg, "Who financed it?", 51.5531, -0.1977, "Achilles Road, West Hampstead"
+                )
+            )
+
+            events = {
+                e["event_type"]: e["payload"]
+                for e in store.get_recent_events(client_id="elmo", session_id=sess.session_id)
+            }
+            nar = events[BackendEventType.NARRATION_COMPLETED]
+            self.assertEqual(nar["thinking_level"], "medium")
+            self.assertEqual(nar["prompt_tokens"], 1200)
+            self.assertEqual(nar["output_tokens"], 250)
+            self.assertEqual(nar["thought_tokens"], 500)
+            self.assertEqual(nar["cached_tokens"], 0)
+            self.assertEqual(nar["total_tokens"], 1950)
+            self.assertNotIn("tool_use_prompt_tokens", nar)
+
+            chat = events[BackendEventType.CHAT_COMPLETED]
+            self.assertEqual(chat["thinking_level"], "medium")
+            self.assertEqual(chat["prompt_tokens"], 5000)
+            self.assertEqual(chat["cached_tokens"], 4100)
+            self.assertEqual(chat["thought_tokens"], 320)
+            self.assertEqual(chat["search_query_count"], 2)
+            store.close()
 
     def test_resolve_data_dir_and_app_paths(self) -> None:
         self.assertEqual(resolve_data_dir(""), PROJECT_ROOT / "data")

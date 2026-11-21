@@ -223,6 +223,7 @@ function renderStateUI() {
 function bindDomEvents() {
   document.getElementById("versionBadge").addEventListener("click", drawers.openSimDrawer);
   document.getElementById("autoToggleBtn").addEventListener("click", drawers.toggleAutoTrigger);
+  document.getElementById("newWalkBtn").addEventListener("click", drawers.startNewWalk);
   document.getElementById("pocketBtn").addEventListener("click", enterPocketMode);
   document.getElementById("openSimBtn").addEventListener("click", drawers.openSimDrawer);
   document.getElementById("openConfigBtn").addEventListener("click", drawers.openConfigDrawer);
@@ -274,7 +275,7 @@ function bindDomEvents() {
     .addEventListener("click", () => drawers.nudgeSim(150, 0));
   document.getElementById("nudgeEastBtn").addEventListener("click", () => drawers.nudgeSim(0, 150));
   document.getElementById("resumeGpsBtn").addEventListener("click", drawers.resumeRealGps);
-  document.getElementById("resetSessionBtn").addEventListener("click", drawers.resetSession);
+  document.getElementById("simNewWalkBtn").addEventListener("click", drawers.startNewWalk);
 
   // Config drawer events
   const configBackdrop = document.getElementById("configBackdrop");
