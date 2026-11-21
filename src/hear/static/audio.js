@@ -1,3 +1,5 @@
+import { PlaybackState, patchSection } from "./state.js";
+
 export function createAudioController({
   mainAudio,
   audioBar,
@@ -11,30 +13,50 @@ export function createAudioController({
 
   function setupAudioEvents() {
     mainAudio.addEventListener("play", () => {
-      state.isPlayingAudio = true;
-      state.isPausedAudio = false;
+      patchSection("playback", { status: PlaybackState.PLAYING, lastError: null }, "audio_play");
     });
     mainAudio.addEventListener("pause", () => {
       if (mainAudio.ended) return;
-      state.isPlayingAudio = false;
-      state.isPausedAudio = mainAudio.currentTime > 0;
+      patchSection(
+        "playback",
+        { status: mainAudio.currentTime > 0 ? PlaybackState.PAUSED : PlaybackState.IDLE },
+        "audio_pause"
+      );
     });
     mainAudio.addEventListener("ended", () => {
-      state.isPlayingAudio = false;
-      state.isPausedAudio = false;
+      patchSection("playback", { status: PlaybackState.IDLE }, "audio_ended");
       onAudioEnded();
     });
     mainAudio.addEventListener("error", () => {
-      state.isPlayingAudio = false;
-      state.isPausedAudio = false;
+      const code = mainAudio.error?.code;
+      patchSection(
+        "playback",
+        {
+          status: PlaybackState.ERROR,
+          lastError: code ? `media_error_${code}` : "media_error",
+        },
+        "audio_error"
+      );
     });
   }
 
   function playAudioUrl(url, title, subtitle) {
     audioBar.classList.add("visible");
     mainAudio.src = url;
-    mainAudio.playbackRate = state.playbackSpeeds[state.speedIdx];
-    mainAudio.play().catch((e) => console.warn("Audio play blocked until user gesture:", e));
+    mainAudio.playbackRate = state.playback.speeds[state.playback.speedIdx];
+    patchSection(
+      "playback",
+      { currentTitle: title || "Historical Narration", lastError: null },
+      "audio_load"
+    );
+    mainAudio.play().catch((e) => {
+      console.warn("Audio play blocked until user gesture:", e);
+      patchSection(
+        "playback",
+        { status: PlaybackState.PAUSED, lastError: e?.name || "autoplay_blocked" },
+        "audio_autoplay_blocked"
+      );
+    });
 
     if ("mediaSession" in navigator) {
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -50,29 +72,40 @@ export function createAudioController({
     window.speechSynthesis.cancel();
     const utter = new SpeechSynthesisUtterance(text);
     activeSpeechUtterance = utter;
-    utter.rate = state.playbackSpeeds[state.speedIdx];
+    utter.rate = state.playback.speeds[state.playback.speedIdx];
     utter.onstart = () => {
-      if (activeSpeechUtterance === utter) state.isPlayingAudio = true;
+      if (activeSpeechUtterance === utter) {
+        patchSection(
+          "playback",
+          { status: PlaybackState.PLAYING, currentTitle: "Browser TTS", lastError: null },
+          "tts_play"
+        );
+      }
     };
     utter.onend = () => {
       if (activeSpeechUtterance !== utter) return;
       activeSpeechUtterance = null;
-      state.isPlayingAudio = false;
+      patchSection("playback", { status: PlaybackState.IDLE }, "tts_ended");
       onAudioEnded();
     };
-    utter.onerror = () => {
+    utter.onerror = (ev) => {
       if (activeSpeechUtterance !== utter) return;
       activeSpeechUtterance = null;
-      state.isPlayingAudio = false;
+      patchSection(
+        "playback",
+        { status: PlaybackState.ERROR, lastError: ev?.error || "tts_error" },
+        "tts_error"
+      );
     };
     window.speechSynthesis.speak(utter);
   }
 
   function cycleSpeed() {
-    state.speedIdx = (state.speedIdx + 1) % state.playbackSpeeds.length;
-    const rate = state.playbackSpeeds[state.speedIdx];
+    const nextIdx = (state.playback.speedIdx + 1) % state.playback.speeds.length;
+    const rate = state.playback.speeds[nextIdx];
     mainAudio.playbackRate = rate;
     speedBtn.textContent = `${rate}x`;
+    patchSection("playback", { speedIdx: nextIdx }, "audio_speed");
   }
 
   function setupMediaSession() {
@@ -121,7 +154,12 @@ export function createAudioController({
       keepAliveAudio = new Audio(URL.createObjectURL(blob));
       keepAliveAudio.loop = true;
       keepAliveAudio.volume = 0.01;
-      keepAliveAudio.play().catch(() => {});
+      keepAliveAudio
+        .play()
+        .then(() => {
+          patchSection("playback", { keepAliveActive: true }, "keepalive_started");
+        })
+        .catch(() => {});
     } catch (e) {
       console.warn("Silent keep-alive init failed:", e);
     }
@@ -136,8 +174,11 @@ export function createAudioController({
       window.speechSynthesis.cancel();
     }
     activeSpeechUtterance = null;
-    state.isPlayingAudio = false;
-    state.isPausedAudio = false;
+    patchSection(
+      "playback",
+      { status: PlaybackState.IDLE, currentTitle: null, lastError: null },
+      "audio_reset"
+    );
   }
 
   return {

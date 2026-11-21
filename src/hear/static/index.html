@@ -31,10 +31,12 @@
     <div class="location-bar">
       <div id="locLabel" class="loc-title">Waiting for GPS lock…</div>
       <div class="telemetry-row">
-        <span id="coordBadge" class="badge">--.-----, --.-----</span>
-        <span id="distBadge" class="badge">Dist: 0m / 120m</span>
-        <span id="cooldownBadge" class="badge">Ready</span>
+        <span id="gpsStatusBadge" class="badge">GPS: waiting</span>
+        <span id="distBadge" class="badge">Moved: 0m / 120m</span>
+        <button type="button" id="statusGateBadge" class="badge clickable" title="Tap to toggle live state inspector">Waiting for GPS</button>
+        <span id="syncBadge" class="badge">Sync: --</span>
       </div>
+      <div id="stateInspectorPanel" class="state-panel" aria-live="polite"></div>
     </div>
   </header>
 

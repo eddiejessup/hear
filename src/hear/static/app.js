@@ -5,7 +5,25 @@ import {
   renderDebugInfo,
   updateAutoTriggerButton,
 } from "./drawers.js";
-import { appState, approxDistanceMeters, escapeHtml } from "./state.js";
+import {
+  GenerationState,
+  GpsState,
+  NetworkState,
+  WakeLockState,
+  appState,
+  approxDistanceMeters,
+  computeTriggerGate,
+  escapeHtml,
+  formatAgeShort,
+  getEffectiveGpsStatus,
+  getEstimatedCooldownRemaining,
+  isGenerating,
+  isPausedAudio,
+  isPlayingAudio,
+  patchSection,
+  setTopLevelState,
+  subscribeState,
+} from "./state.js";
 
 const mainAudio = document.getElementById("mainAudio");
 const audioBar = document.getElementById("audioBar");
@@ -26,8 +44,155 @@ const drawers = createDrawersController({
   renderLensesStrip,
   sendPing,
   startGpsWatch,
-  updateLocationHeader,
 });
+
+// ---------------------------------------------------------------------------
+// Live State UI Rendering (driven by state subscriptions + 1s ticker)
+// ---------------------------------------------------------------------------
+function setBadge(el, text, tone = "muted") {
+  if (!el) return;
+  el.textContent = text;
+  const clickable = el.classList.contains("clickable") ? " clickable" : "";
+  const toneClass = tone && tone !== "muted" ? ` tone-${tone}` : "";
+  el.className = `badge${clickable}${toneClass}`;
+}
+
+function renderStateUI() {
+  const nowMs = Date.now();
+  const gpsStatus = getEffectiveGpsStatus(appState, nowMs);
+  const coords = appState.gps.coords;
+  const trig = appState.trigger.status;
+  const gate = computeTriggerGate(appState, nowMs);
+
+  // 1. GPS indicator dot & location title
+  const gpsDot = document.getElementById("gpsDot");
+  if (gpsStatus === GpsState.ACTIVE || gpsStatus === GpsState.SIMULATED) {
+    gpsDot.className = "gps-dot active";
+  } else if (gpsStatus === GpsState.ERROR || gpsStatus === GpsState.UNSUPPORTED) {
+    gpsDot.className = "gps-dot error";
+  } else {
+    gpsDot.className = "gps-dot";
+  }
+
+  const locLabel = document.getElementById("locLabel");
+  if (coords) {
+    locLabel.textContent =
+      coords.short_label || `${coords.lat.toFixed(5)}, ${coords.lon.toFixed(5)}`;
+  } else if (gpsStatus === GpsState.UNSUPPORTED) {
+    locLabel.textContent = "Geolocation not supported in this browser";
+  } else if (gpsStatus === GpsState.ERROR && appState.gps.lastError) {
+    locLabel.textContent = `GPS waiting (${appState.gps.lastError}) — or use Sim`;
+  } else {
+    locLabel.textContent = "Waiting for GPS lock…";
+  }
+
+  // 2. GPS freshness badge
+  const gpsBadge = document.getElementById("gpsStatusBadge");
+  if (gpsStatus === GpsState.SIMULATED) {
+    setBadge(gpsBadge, "GPS: sim", "active");
+  } else if (gpsStatus === GpsState.ACTIVE) {
+    const age = formatAgeShort(appState.gps.lastFixAt, nowMs);
+    const acc = coords?.accuracy ? ` ±${Math.round(coords.accuracy)}m` : "";
+    setBadge(gpsBadge, `GPS: ${age}${acc}`, "ok");
+  } else if (gpsStatus === GpsState.STALE) {
+    const age = formatAgeShort(appState.gps.lastFixAt, nowMs);
+    setBadge(gpsBadge, `GPS stale (${age})`, "warn");
+  } else if (gpsStatus === GpsState.ERROR || gpsStatus === GpsState.UNSUPPORTED) {
+    setBadge(gpsBadge, "GPS: err", "error");
+  } else {
+    setBadge(gpsBadge, "GPS: waiting", "warn");
+  }
+
+  // 3. Distance badge
+  const distBadge = document.getElementById("distBadge");
+  const minDist = Math.round(
+    trig?.min_distance_m ?? appState.currentConfig?.triggers?.min_distance_meters ?? 120
+  );
+  const distVal =
+    trig?.distance_moved_m !== null && trig?.distance_moved_m !== undefined
+      ? `${Math.round(trig.distance_moved_m)}m`
+      : "0m";
+  setBadge(distBadge, `Moved: ${distVal} / ${minDist}m`, "muted");
+
+  // 4. Primary trigger/activity gate badge (clickable to inspect full state)
+  const gateBadge = document.getElementById("statusGateBadge");
+  setBadge(gateBadge, gate.label, gate.tone);
+
+  // 5. Sync / device health badge
+  const syncBadge = document.getElementById("syncBadge");
+  const wlSuffix = appState.device.wakeLock === WakeLockState.ACTIVE ? " • WL" : "";
+  if (appState.network.status === NetworkState.OFFLINE) {
+    setBadge(syncBadge, `Offline${wlSuffix}`, "error");
+  } else if (appState.network.status === NetworkState.ERROR) {
+    setBadge(syncBadge, `Sync err${wlSuffix}`, "error");
+  } else if (appState.network.lastPingAt) {
+    const pingAge = formatAgeShort(appState.network.lastPingAt, nowMs);
+    setBadge(syncBadge, `Sync: ${pingAge}${wlSuffix}`, "muted");
+  } else {
+    setBadge(syncBadge, `Sync: --${wlSuffix}`, "muted");
+  }
+
+  // 6. Pocket Mode status line
+  const pocketStatus = document.getElementById("pocketStatus");
+  if (pocketStatus) {
+    const place = coords?.short_label || "No GPS";
+    pocketStatus.textContent = `${place} • Moved ${distVal} • ${gate.label}`;
+  }
+
+  // 7. Collapsible State Inspector panel (only render DOM when expanded)
+  const panel = document.getElementById("stateInspectorPanel");
+  if (panel && panel.classList.contains("open")) {
+    const coordStr = coords
+      ? `${coords.lat.toFixed(5)}, ${coords.lon.toFixed(5)}${coords.accuracy ? ` (±${Math.round(coords.accuracy)}m)` : ""}`
+      : "--";
+    const cooldownS = getEstimatedCooldownRemaining(appState, nowMs);
+    const silenceStr =
+      trig?.silence_elapsed_s !== null && trig?.silence_elapsed_s !== undefined
+        ? `${Math.round(trig.silence_elapsed_s)}s / ${Math.round(trig.max_silence_s)}s`
+        : "--";
+    const speedRate = appState.playback.speeds[appState.playback.speedIdx];
+    const items = [
+      ["GPS", `${gpsStatus} • fix ${formatAgeShort(appState.gps.lastFixAt, nowMs)}`],
+      ["Coords", coordStr],
+      ["Gate", `${gate.code} (${gate.label})`],
+      ["Cooldown / Silence", `${Math.ceil(cooldownS)}s • ${silenceStr}`],
+      [
+        "Playback",
+        `${appState.playback.status} • ${speedRate}x • KA:${appState.playback.keepAliveActive ? "on" : "off"}`,
+      ],
+      [
+        "Generation",
+        appState.generation.status === GenerationState.IDLE
+          ? "idle"
+          : `${appState.generation.status} (${appState.generation.reason || "manual"})`,
+      ],
+      [
+        "Device",
+        `vis:${appState.device.visibility} • wl:${appState.device.wakeLock} • pocket:${appState.device.pocketMode ? "on" : "off"}`,
+      ],
+      [
+        "Network",
+        `${appState.network.status} • ping ${formatAgeShort(appState.network.lastPingAt, nowMs)}${appState.network.lastError ? ` (${appState.network.lastError})` : ""}`,
+      ],
+      ["Session", appState.sessionId || "--"],
+    ];
+    if (appState.gps.lastError) {
+      items.push(["GPS Error", appState.gps.lastError]);
+    }
+    if (appState.playback.lastError) {
+      items.push(["Audio Error", appState.playback.lastError]);
+    }
+    panel.innerHTML = items
+      .map(
+        ([label, val]) => `
+        <div class="state-item">
+          <span class="state-item-label">${escapeHtml(label)}</span>
+          <span class="state-item-value" title="${escapeHtml(val)}">${escapeHtml(val)}</span>
+        </div>`
+      )
+      .join("");
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Initialization & Event Wiring
@@ -38,6 +203,11 @@ function bindDomEvents() {
   document.getElementById("pocketBtn").addEventListener("click", enterPocketMode);
   document.getElementById("openSimBtn").addEventListener("click", drawers.openSimDrawer);
   document.getElementById("openConfigBtn").addEventListener("click", drawers.openConfigDrawer);
+
+  document.getElementById("statusGateBadge").addEventListener("click", () => {
+    document.getElementById("stateInspectorPanel").classList.toggle("open");
+    renderStateUI();
+  });
 
   document
     .getElementById("narrateBtn")
@@ -96,15 +266,34 @@ function bindDomEvents() {
       removeBtn.closest(".lens-editor-item")?.remove();
     }
   });
+
+  // Device & network lifecycle listeners
+  document.addEventListener("visibilitychange", () => {
+    const visibility = document.visibilityState;
+    patchSection("device", { visibility }, "visibility_change");
+    if (visibility === "visible" && appState.device.pocketMode) {
+      requestScreenWakeLock();
+    }
+  });
+  window.addEventListener("online", () => {
+    patchSection("network", { status: NetworkState.OK, lastError: null }, "network_online");
+    sendPing(false);
+  });
+  window.addEventListener("offline", () => {
+    patchSection("network", { status: NetworkState.OFFLINE }, "network_offline");
+  });
 }
 
 async function init() {
+  subscribeState(() => renderStateUI());
   bindDomEvents();
   audio.setupAudioEvents();
   audio.setupMediaSession();
+  renderStateUI();
   await fetchInitialState();
   startGpsWatch();
   setInterval(periodicPing, 6000);
+  setInterval(renderStateUI, 1000);
 }
 
 async function fetchInitialState() {
@@ -112,11 +301,25 @@ async function fetchInitialState() {
     const res = await apiFetch("/api/state");
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
+      patchSection(
+        "network",
+        { status: NetworkState.ERROR, lastError: `HTTP ${res.status}` },
+        "state_error"
+      );
       addSystemBanner(`⚠️ ${err.detail || res.statusText}`);
       return;
     }
     const data = await res.json();
-    appState.currentConfig = data.config;
+    setTopLevelState(
+      { sessionId: data.session_id, currentConfig: data.config },
+      "initial_state"
+    );
+    patchSection("network", { status: NetworkState.OK, lastError: null }, "initial_state");
+    patchSection(
+      "trigger",
+      { status: data.trigger_status, updatedAt: Date.now() },
+      "initial_state"
+    );
     renderLensesStrip(appState.currentConfig.lenses || []);
     updateAutoTriggerButton(appState.currentConfig.triggers?.auto_trigger_enabled ?? true);
     renderDebugInfo(data.debug_info, data.session_id);
@@ -128,8 +331,11 @@ async function fetchInitialState() {
     }
 
     if (data.current_location) {
-      appState.currentCoords = data.current_location;
-      updateLocationHeader(data.current_location, data.trigger_status);
+      patchSection(
+        "gps",
+        { coords: data.current_location },
+        "initial_location"
+      );
     }
 
     if (data.messages && data.messages.length > 0) {
@@ -140,6 +346,11 @@ async function fetchInitialState() {
     }
   } catch (err) {
     console.error("Failed to load initial state:", err);
+    patchSection(
+      "network",
+      { status: NetworkState.ERROR, lastError: err?.message || "init_failed" },
+      "state_error"
+    );
   }
 }
 
@@ -148,31 +359,42 @@ async function fetchInitialState() {
 // ---------------------------------------------------------------------------
 function startGpsWatch() {
   if (!navigator.geolocation) {
-    document.getElementById("locLabel").textContent = "Geolocation not supported in this browser";
-    document.getElementById("gpsDot").className = "gps-dot error";
+    patchSection(
+      "gps",
+      { status: GpsState.UNSUPPORTED, lastError: "Geolocation unsupported" },
+      "gps_unsupported"
+    );
     return;
   }
-  if (appState.watchId !== null) {
-    navigator.geolocation.clearWatch(appState.watchId);
+  if (appState.gps.watchId !== null) {
+    navigator.geolocation.clearWatch(appState.gps.watchId);
   }
-  appState.watchId = navigator.geolocation.watchPosition(
+  const watchId = navigator.geolocation.watchPosition(
     (pos) => {
-      if (appState.useSimulatedGps) return;
-      document.getElementById("gpsDot").className = "gps-dot active";
-      appState.currentCoords = {
-        lat: pos.coords.latitude,
-        lon: pos.coords.longitude,
-        accuracy: pos.coords.accuracy,
-        heading: pos.coords.heading,
-        speed: pos.coords.speed,
-      };
+      if (appState.gps.simulated) return;
+      patchSection(
+        "gps",
+        {
+          status: GpsState.ACTIVE,
+          lastFixAt: Date.now(),
+          lastError: null,
+          coords: {
+            lat: pos.coords.latitude,
+            lon: pos.coords.longitude,
+            accuracy: pos.coords.accuracy,
+            heading: pos.coords.heading,
+            speed: pos.coords.speed,
+            short_label: appState.gps.coords?.short_label,
+          },
+        },
+        "gps_fix"
+      );
       sendPing(false);
     },
     (err) => {
-      if (appState.useSimulatedGps) return;
+      if (appState.gps.simulated) return;
       console.warn("GPS watch error:", err.message);
-      document.getElementById("gpsDot").className = "gps-dot error";
-      document.getElementById("locLabel").textContent = `GPS waiting (${err.message}) — or use Sim`;
+      patchSection("gps", { status: GpsState.ERROR, lastError: err.message }, "gps_error");
     },
     {
       enableHighAccuracy: true,
@@ -180,22 +402,22 @@ function startGpsWatch() {
       timeout: 15000,
     }
   );
+  patchSection("gps", { watchId }, "gps_watch_started");
 }
 
 async function periodicPing() {
-  if (!appState.currentCoords || appState.isGenerating) return;
+  const coords = appState.gps.coords;
+  if (!coords || isGenerating()) return;
   const autoEnabled = appState.currentConfig?.triggers?.auto_trigger_enabled ?? false;
+  const playing = isPlayingAudio();
+  const paused = isPausedAudio();
+  const snap = appState.network.lastPingSnapshot;
   if (
     !autoEnabled &&
-    appState.lastPingSnapshot &&
-    appState.lastPingSnapshot.isPlayingAudio === appState.isPlayingAudio &&
-    appState.lastPingSnapshot.isPausedAudio === appState.isPausedAudio &&
-    approxDistanceMeters(
-      appState.currentCoords.lat,
-      appState.currentCoords.lon,
-      appState.lastPingSnapshot.lat,
-      appState.lastPingSnapshot.lon
-    ) < 3.0
+    snap &&
+    snap.isPlayingAudio === playing &&
+    snap.isPausedAudio === paused &&
+    approxDistanceMeters(coords.lat, coords.lon, snap.lat, snap.lon) < 3.0
   ) {
     return;
   }
@@ -203,91 +425,80 @@ async function periodicPing() {
 }
 
 async function sendPing(audioJustEnded = false) {
-  if (!appState.currentCoords) return;
-  if (appState.pingInFlight && !audioJustEnded) return;
-  appState.pingInFlight = true;
+  const coords = appState.gps.coords;
+  if (!coords) return;
+  if (appState.network.pingInFlight && !audioJustEnded) return;
+  appState.network.pingInFlight = true;
+  const playing = isPlayingAudio();
+  const paused = isPausedAudio();
   try {
     const res = await apiFetch("/api/ping", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        lat: appState.currentCoords.lat,
-        lon: appState.currentCoords.lon,
-        accuracy: appState.currentCoords.accuracy ?? null,
-        heading: appState.currentCoords.heading ?? null,
-        speed: appState.currentCoords.speed ?? null,
-        is_playing_audio: appState.isPlayingAudio,
-        is_paused_audio: appState.isPausedAudio,
+        lat: coords.lat,
+        lon: coords.lon,
+        accuracy: coords.accuracy ?? null,
+        heading: coords.heading ?? null,
+        speed: coords.speed ?? null,
+        is_playing_audio: playing,
+        is_paused_audio: paused,
         audio_just_ended: audioJustEnded,
       }),
     });
-    if (!res.ok) return;
-    const data = await res.json();
-    if (data.location?.short_label && appState.currentCoords) {
-      appState.currentCoords = {
-        ...appState.currentCoords,
-        short_label: data.location.short_label,
-      };
+    if (!res.ok) {
+      patchSection(
+        "network",
+        { status: NetworkState.ERROR, lastError: `Ping HTTP ${res.status}` },
+        "ping_error"
+      );
+      return;
     }
-    appState.lastPingSnapshot = {
-      lat: appState.currentCoords.lat,
-      lon: appState.currentCoords.lon,
-      isPlayingAudio: appState.isPlayingAudio,
-      isPausedAudio: appState.isPausedAudio,
-    };
-    updateLocationHeader(data.location, data.trigger_status);
+    const data = await res.json();
+    const nowMs = Date.now();
+    if (data.location?.short_label && appState.gps.coords) {
+      patchSection(
+        "gps",
+        { coords: { ...appState.gps.coords, short_label: data.location.short_label } },
+        "gps_label"
+      );
+    }
+    patchSection(
+      "network",
+      {
+        status: NetworkState.OK,
+        lastPingAt: nowMs,
+        lastError: null,
+        lastPingSnapshot: {
+          lat: coords.lat,
+          lon: coords.lon,
+          isPlayingAudio: playing,
+          isPausedAudio: paused,
+        },
+      },
+      "ping_ok"
+    );
+    patchSection(
+      "trigger",
+      { status: data.trigger_status, updatedAt: nowMs },
+      "ping_ok"
+    );
 
-    if (
-      data.trigger_status?.should_trigger &&
-      !appState.isGenerating &&
-      !appState.isPlayingAudio
-    ) {
+    if (data.trigger_status?.should_trigger && !isGenerating() && !isPlayingAudio()) {
       triggerNarration(data.trigger_status.trigger_reason || "auto");
     }
   } catch (err) {
     console.warn("Ping failed:", err);
+    patchSection(
+      "network",
+      {
+        status: navigator.onLine === false ? NetworkState.OFFLINE : NetworkState.ERROR,
+        lastError: err?.message || "network_error",
+      },
+      "ping_error"
+    );
   } finally {
-    appState.pingInFlight = false;
-  }
-}
-
-function updateLocationHeader(loc, status) {
-  if (loc) {
-    document.getElementById("locLabel").textContent =
-      loc.short_label || `${loc.lat.toFixed(5)}, ${loc.lon.toFixed(5)}`;
-    const acc = loc.accuracy
-      ? ` ±${Math.round(loc.accuracy)}m`
-      : appState.useSimulatedGps
-        ? " (sim)"
-        : "";
-    document.getElementById("coordBadge").textContent =
-      `${loc.lat.toFixed(5)}, ${loc.lon.toFixed(5)}${acc}`;
-  }
-  if (status) {
-    const dist =
-      status.distance_moved_m !== null && status.distance_moved_m !== undefined
-        ? `${Math.round(status.distance_moved_m)}m`
-        : "0m";
-    document.getElementById("distBadge").textContent =
-      `Moved: ${dist} / ${Math.round(status.min_distance_m)}m`;
-
-    const cdBadge = document.getElementById("cooldownBadge");
-    if (status.is_generating) {
-      cdBadge.textContent = "Researching…";
-    } else if (appState.isPlayingAudio) {
-      cdBadge.textContent = "Playing audio";
-    } else if (status.is_paused_audio) {
-      cdBadge.textContent = "Paused (holding)";
-    } else if (status.cooldown_remaining_s > 0) {
-      cdBadge.textContent = `Cooldown: ${Math.ceil(status.cooldown_remaining_s)}s`;
-    } else {
-      cdBadge.textContent = status.auto_trigger_enabled ? "Armed" : "Manual";
-    }
-
-    const pocketStatus = document.getElementById("pocketStatus");
-    if (pocketStatus) {
-      pocketStatus.textContent = `${loc?.short_label || ""} • Moved ${dist}`;
-    }
+    appState.network.pingInFlight = false;
   }
 }
 
@@ -295,8 +506,9 @@ function updateLocationHeader(loc, status) {
 // Narration & Chat Steering
 // ---------------------------------------------------------------------------
 async function triggerNarration(reason = "manual") {
-  if (appState.isGenerating) return;
-  if (!appState.currentCoords) {
+  if (isGenerating()) return;
+  const coords = appState.gps.coords;
+  if (!coords) {
     alert(
       "Waiting for GPS coordinates (or open 'Sim' in the top bar to test with simulated coordinates)."
     );
@@ -304,20 +516,23 @@ async function triggerNarration(reason = "manual") {
   }
 
   audio.ensureSilentKeepAlive();
-  appState.isGenerating = true;
+  patchSection(
+    "generation",
+    { status: GenerationState.NARRATING, startedAt: Date.now(), reason },
+    "narration_start"
+  );
   const btn = document.getElementById("narrateBtn");
   btn.disabled = true;
   btn.innerHTML = `<span>⏳ Researching &amp; generating audio…</span>`;
-  document.getElementById("cooldownBadge").textContent = "Researching…";
 
   try {
     const res = await apiFetch("/api/narrate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        lat: appState.currentCoords.lat,
-        lon: appState.currentCoords.lon,
-        heading: appState.currentCoords.heading ?? null,
+        lat: coords.lat,
+        lon: coords.lon,
+        heading: coords.heading ?? null,
         lens_id: appState.selectedLensId || null,
         reason,
       }),
@@ -326,6 +541,11 @@ async function triggerNarration(reason = "manual") {
     const data = await res.json();
     if (!res.ok) {
       if (res.status !== 409) {
+        patchSection(
+          "network",
+          { status: NetworkState.ERROR, lastError: `Narrate HTTP ${res.status}` },
+          "narration_error"
+        );
         addSystemBanner(`Error: ${data.detail || res.statusText}`);
       }
       return;
@@ -333,18 +553,33 @@ async function triggerNarration(reason = "manual") {
 
     const emptyEl = document.getElementById("emptyState");
     if (emptyEl) emptyEl.style.display = "none";
-    if (data.message?.location?.short_label && appState.currentCoords) {
-      appState.currentCoords = {
-        ...appState.currentCoords,
-        short_label: data.message.location.short_label,
-      };
+    if (data.message?.location?.short_label && appState.gps.coords) {
+      patchSection(
+        "gps",
+        { coords: { ...appState.gps.coords, short_label: data.message.location.short_label } },
+        "gps_label"
+      );
     }
+    patchSection("network", { status: NetworkState.OK, lastError: null }, "narration_ok");
+    patchSection(
+      "trigger",
+      { status: data.trigger_status, updatedAt: Date.now() },
+      "narration_ok"
+    );
     appendMessageCard(data.message, true);
-    updateLocationHeader(appState.currentCoords, data.trigger_status);
   } catch (err) {
+    patchSection(
+      "network",
+      { status: NetworkState.ERROR, lastError: err?.message || "network_error" },
+      "narration_error"
+    );
     addSystemBanner(`Network error: ${err.message}`);
   } finally {
-    appState.isGenerating = false;
+    patchSection(
+      "generation",
+      { status: GenerationState.IDLE, startedAt: null, reason: null },
+      "narration_end"
+    );
     btn.disabled = false;
     btn.innerHTML = `<span>🎙️ Tell me about here</span>`;
   }
@@ -354,11 +589,15 @@ async function sendChat(event) {
   event.preventDefault();
   const input = document.getElementById("chatInput");
   const text = input.value.trim();
-  if (!text || appState.isGenerating) return;
+  if (!text || isGenerating()) return;
 
   audio.ensureSilentKeepAlive();
   input.value = "";
-  appState.isGenerating = true;
+  patchSection(
+    "generation",
+    { status: GenerationState.CHATTING, startedAt: Date.now(), reason: "chat" },
+    "chat_start"
+  );
   document.getElementById("sendBtn").disabled = true;
 
   const emptyEl = document.getElementById("emptyState");
@@ -367,7 +606,7 @@ async function sendChat(event) {
     {
       role: "user",
       text,
-      location_label: appState.currentCoords?.short_label,
+      location_label: appState.gps.coords?.short_label,
     },
     false
   );
@@ -378,31 +617,56 @@ async function sendChat(event) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message: text,
-        lat: appState.currentCoords?.lat ?? null,
-        lon: appState.currentCoords?.lon ?? null,
+        lat: appState.gps.coords?.lat ?? null,
+        lon: appState.gps.coords?.lon ?? null,
       }),
     });
     const data = await res.json();
     if (!res.ok) {
       userCard?.remove();
       input.value = text;
+      patchSection(
+        "network",
+        { status: NetworkState.ERROR, lastError: `Chat HTTP ${res.status}` },
+        "chat_error"
+      );
       addSystemBanner(`Error: ${data.detail || res.statusText}`);
       return;
     }
-    if (data.assistant_message?.location?.short_label && appState.currentCoords) {
-      appState.currentCoords = {
-        ...appState.currentCoords,
-        short_label: data.assistant_message.location.short_label,
-      };
+    if (data.assistant_message?.location?.short_label && appState.gps.coords) {
+      patchSection(
+        "gps",
+        {
+          coords: {
+            ...appState.gps.coords,
+            short_label: data.assistant_message.location.short_label,
+          },
+        },
+        "gps_label"
+      );
     }
+    patchSection("network", { status: NetworkState.OK, lastError: null }, "chat_ok");
+    patchSection(
+      "trigger",
+      { status: data.trigger_status, updatedAt: Date.now() },
+      "chat_ok"
+    );
     appendMessageCard(data.assistant_message, true);
-    updateLocationHeader(appState.currentCoords, data.trigger_status);
   } catch (err) {
     userCard?.remove();
     input.value = text;
+    patchSection(
+      "network",
+      { status: NetworkState.ERROR, lastError: err?.message || "network_error" },
+      "chat_error"
+    );
     addSystemBanner(`Chat error: ${err.message}`);
   } finally {
-    appState.isGenerating = false;
+    patchSection(
+      "generation",
+      { status: GenerationState.IDLE, startedAt: null, reason: null },
+      "chat_end"
+    );
     document.getElementById("sendBtn").disabled = false;
   }
 }
@@ -418,7 +682,7 @@ function renderLensesStrip(lenses) {
   randomChip.className = `lens-chip ${appState.selectedLensId === "" ? "selected" : ""}`;
   randomChip.textContent = "🎲 Random Pool";
   randomChip.addEventListener("click", () => {
-    appState.selectedLensId = "";
+    setTopLevelState({ selectedLensId: "" }, "lens_selected");
     renderLensesStrip(lenses);
   });
   strip.appendChild(randomChip);
@@ -429,7 +693,7 @@ function renderLensesStrip(lenses) {
     chip.className = `lens-chip ${appState.selectedLensId === lens.id ? "selected" : ""}`;
     chip.textContent = lens.name;
     chip.addEventListener("click", () => {
-      appState.selectedLensId = lens.id;
+      setTopLevelState({ selectedLensId: lens.id }, "lens_selected");
       renderLensesStrip(lenses);
     });
     strip.appendChild(chip);
@@ -511,27 +775,57 @@ function addSystemBanner(text) {
 // ---------------------------------------------------------------------------
 // Pocket Mode (WakeLock + Pure-Black OLED Overlay)
 // ---------------------------------------------------------------------------
+async function requestScreenWakeLock() {
+  if (!("wakeLock" in navigator)) return;
+  if (appState.device.wakeLockSentinel) return;
+  try {
+    const sentinel = await navigator.wakeLock.request("screen");
+    sentinel.addEventListener("release", () => {
+      if (appState.device.wakeLockSentinel === sentinel) {
+        patchSection(
+          "device",
+          { wakeLock: WakeLockState.OFF, wakeLockSentinel: null },
+          "wakelock_released"
+        );
+      }
+    });
+    patchSection(
+      "device",
+      { wakeLock: WakeLockState.ACTIVE, wakeLockSentinel: sentinel, wakeLockError: null },
+      "wakelock_acquired"
+    );
+  } catch (e) {
+    console.warn("WakeLock request failed:", e);
+    patchSection(
+      "device",
+      { wakeLock: WakeLockState.ERROR, wakeLockError: e?.message || "wakelock_failed" },
+      "wakelock_error"
+    );
+  }
+}
+
 async function enterPocketMode() {
   audio.ensureSilentKeepAlive();
   document.getElementById("pocketOverlay").classList.add("active");
-  if ("wakeLock" in navigator) {
-    try {
-      appState.wakeLockSentinel = await navigator.wakeLock.request("screen");
-    } catch (e) {
-      console.warn("WakeLock request failed:", e);
-    }
-  }
+  patchSection("device", { pocketMode: true }, "pocket_enter");
+  await requestScreenWakeLock();
 }
 
 async function exitPocketMode() {
   document.getElementById("pocketOverlay").classList.remove("active");
-  if (appState.wakeLockSentinel) {
+  patchSection("device", { pocketMode: false }, "pocket_exit");
+  const sentinel = appState.device.wakeLockSentinel;
+  if (sentinel) {
     try {
-      await appState.wakeLockSentinel.release();
+      await sentinel.release();
     } catch (_e) {
       // Ignore already-released WakeLock errors
     }
-    appState.wakeLockSentinel = null;
+    patchSection(
+      "device",
+      { wakeLock: WakeLockState.OFF, wakeLockSentinel: null },
+      "wakelock_released"
+    );
   }
 }
 

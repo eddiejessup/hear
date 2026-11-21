@@ -1,5 +1,12 @@
 import { apiFetch } from "./api.js";
-import { escapeHtml, formatUptime, parseNonNegativeFloat } from "./state.js";
+import {
+  GpsState,
+  escapeHtml,
+  formatUptime,
+  parseNonNegativeFloat,
+  patchSection,
+  setTopLevelState,
+} from "./state.js";
 
 function setSelectValuePreservingCustom(selectEl, value, fallback) {
   const resolved = value || fallback;
@@ -47,13 +54,13 @@ export function createDrawersController({
   renderLensesStrip,
   sendPing,
   startGpsWatch,
-  updateLocationHeader,
 }) {
   async function refreshDebugInfoOnly() {
     try {
       const res = await apiFetch("/api/state");
       if (!res.ok) return;
       const data = await res.json();
+      setTopLevelState({ sessionId: data.session_id }, "session_refresh");
       renderDebugInfo(data.debug_info, data.session_id);
     } catch (_e) {
       // Best-effort refresh when opening simulator drawer
@@ -62,9 +69,9 @@ export function createDrawersController({
 
   function openSimDrawer() {
     refreshDebugInfoOnly();
-    if (state.currentCoords) {
-      document.getElementById("simLat").value = state.currentCoords.lat.toFixed(5);
-      document.getElementById("simLon").value = state.currentCoords.lon.toFixed(5);
+    if (state.gps.coords) {
+      document.getElementById("simLat").value = state.gps.coords.lat.toFixed(5);
+      document.getElementById("simLon").value = state.gps.coords.lon.toFixed(5);
     }
     document.getElementById("simBackdrop").classList.add("open");
   }
@@ -77,9 +84,17 @@ export function createDrawersController({
     const lat = parseFloat(document.getElementById("simLat").value);
     const lon = parseFloat(document.getElementById("simLon").value);
     if (Number.isNaN(lat) || Number.isNaN(lon)) return;
-    state.useSimulatedGps = true;
-    document.getElementById("gpsDot").className = "gps-dot active";
-    state.currentCoords = { lat, lon, accuracy: 5 };
+    patchSection(
+      "gps",
+      {
+        simulated: true,
+        status: GpsState.SIMULATED,
+        coords: { lat, lon, accuracy: 5 },
+        lastFixAt: Date.now(),
+        lastError: null,
+      },
+      "gps_simulated"
+    );
     sendPing(false);
     closeSimDrawer();
   }
@@ -91,8 +106,8 @@ export function createDrawersController({
   }
 
   function nudgeSim(northMeters, eastMeters) {
-    const baseLat = state.currentCoords ? state.currentCoords.lat : 51.5142;
-    const baseLon = state.currentCoords ? state.currentCoords.lon : -0.0885;
+    const baseLat = state.gps.coords ? state.gps.coords.lat : 51.5142;
+    const baseLon = state.gps.coords ? state.gps.coords.lon : -0.0885;
     const dLat = northMeters / 111320;
     const dLon = eastMeters / (111320 * Math.cos((baseLat * Math.PI) / 180));
     document.getElementById("simLat").value = (baseLat + dLat).toFixed(5);
@@ -101,7 +116,7 @@ export function createDrawersController({
   }
 
   function resumeRealGps() {
-    state.useSimulatedGps = false;
+    patchSection("gps", { simulated: false, status: GpsState.WAITING, lastError: null }, "gps_real");
     closeSimDrawer();
     startGpsWatch();
   }
@@ -111,10 +126,15 @@ export function createDrawersController({
     if (res.ok) {
       const data = await res.json();
       audio.stopAndReset();
-      state.lastPingSnapshot = null;
+      setTopLevelState({ sessionId: data.session_id }, "session_reset");
+      patchSection("network", { lastPingSnapshot: null }, "session_reset");
+      patchSection(
+        "trigger",
+        { status: data.trigger_status, updatedAt: Date.now() },
+        "session_reset"
+      );
       document.getElementById("feed").innerHTML =
         `<div id="emptyState" class="empty-state">New walk session started.</div>`;
-      updateLocationHeader(state.currentCoords, data.trigger_status);
       closeSimDrawer();
     }
   }
@@ -123,7 +143,7 @@ export function createDrawersController({
     try {
       const cfgRes = await apiFetch("/api/config");
       if (cfgRes.ok) {
-        state.currentConfig = await cfgRes.json();
+        setTopLevelState({ currentConfig: await cfgRes.json() }, "config_loaded");
       }
     } catch (_e) {
       // Fall back to cached config
@@ -140,7 +160,12 @@ export function createDrawersController({
     });
     if (res.ok) {
       const data = await res.json();
-      state.currentConfig = data.config;
+      setTopLevelState({ currentConfig: data.config }, "config_updated");
+      patchSection(
+        "trigger",
+        { status: data.trigger_status, updatedAt: Date.now() },
+        "config_updated"
+      );
       renderLensesStrip(state.currentConfig.lenses || []);
     }
     sendPing(false);
@@ -193,7 +218,7 @@ export function createDrawersController({
     try {
       const cfgRes = await apiFetch("/api/config");
       if (cfgRes.ok) {
-        state.currentConfig = await cfgRes.json();
+        setTopLevelState({ currentConfig: await cfgRes.json() }, "config_loaded");
       }
     } catch (_e) {
       // Fall back to cached config
@@ -267,7 +292,12 @@ export function createDrawersController({
     });
     if (res.ok) {
       const data = await res.json();
-      state.currentConfig = data.config;
+      setTopLevelState({ currentConfig: data.config }, "config_saved");
+      patchSection(
+        "trigger",
+        { status: data.trigger_status, updatedAt: Date.now() },
+        "config_saved"
+      );
       renderLensesStrip(state.currentConfig.lenses || []);
       closeConfigDrawer();
       sendPing(false);
