@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import asyncio
-import contextlib
+import os
 import tempfile
 import time
 import unittest
@@ -11,52 +13,44 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from hear.app import app
-from hear.auth import verify_token
+from hear.app import create_app
+from hear.auth import AuthSettings, EnvReader, verify_token
 from hear.config import ConfigManager
 from hear.db import HearDB
-from hear.gemini import (
-    call_gemini_text,
-    call_gemini_tts,
-    pcm_to_wav_bytes,
-    prune_old_audio_files,
-)
-from hear.geo import (
-    GeoCache,
-    _fetch_nominatim,
-    compass_bearing_label,
-    haversine_meters,
-)
+from hear.gemini import GeminiClient, pcm_to_wav_bytes, prune_old_audio_files
+from hear.geo import GeoCache, GeoService, compass_bearing_label, haversine_meters
 from hear.models.config import AppConfig, GeminiConfig, LensConfig, TriggersConfig
 from hear.models.events import BackendEventType, EventLevel, EventSource
 from hear.models.gemini import GeminiContent, GeminiPart, GeminiTextResult, GroundingSource
 from hear.models.geo import GeoContext
 from hear.models.session import CurrentLocation, TriggerLocation
-from hear.paths import PROJECT_ROOT, resolve_data_dir
+from hear.paths import PROJECT_ROOT, AppPaths, resolve_data_dir
 from hear.session import SessionManager, WalkSession, sanitize_client_id
 
-_MODULE_STACK: contextlib.ExitStack | None = None
-_TEST_DB: HearDB | None = None
 
+class _FakeGeminiClient:
+    def __init__(self, responses: list[GeminiTextResult], audio_url: str | None = None) -> None:
+        self._responses = list(responses)
+        self._audio_url = audio_url
 
-def setUpModule() -> None:
-    global _MODULE_STACK, _TEST_DB
-    stack = contextlib.ExitStack()
-    tmpdir = stack.enter_context(tempfile.TemporaryDirectory())
-    _TEST_DB = HearDB(Path(tmpdir) / "test_module.db")
-    for target in ("hear.db.db", "hear.logging_utils.db", "hear.app.db"):
-        stack.enter_context(patch(target, _TEST_DB))
-    _MODULE_STACK = stack
+    async def generate_text(
+        self,
+        contents: list[GeminiContent],
+        system_prompt: str,
+        model: str,
+        temperature: float = 0.75,
+        enable_google_search: bool = True,
+    ) -> GeminiTextResult:
+        return self._responses.pop(0)
 
-
-def tearDownModule() -> None:
-    global _MODULE_STACK, _TEST_DB
-    if _TEST_DB is not None:
-        _TEST_DB.close()
-        _TEST_DB = None
-    if _MODULE_STACK is not None:
-        _MODULE_STACK.close()
-        _MODULE_STACK = None
+    async def generate_tts(
+        self,
+        text: str,
+        tts_model: str = "gemini-3.8-flash-tts",
+        voice_name: str = "Charon",
+        style_prompt: str = "",
+    ) -> str | None:
+        return self._audio_url
 
 
 class TestGeoHelpers(unittest.TestCase):
@@ -117,17 +111,19 @@ class TestGeoHelpers(unittest.TestCase):
         self.assertIsNone(cache.find_close_entry(51.5200, -0.0885))
 
     def test_nominatim_failure_backoff(self) -> None:
-        mock_client = AsyncMock()
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.is_closed = False
         mock_client.get.side_effect = httpx.ConnectError("Connection refused")
-        with patch("hear.geo._nominatim_backoff_until", 0.0):
-            res1 = asyncio.run(_fetch_nominatim(mock_client, 51.5142, -0.0885))
-            self.assertFalse(res1[5])
-            self.assertEqual(mock_client.get.call_count, 1)
+        geo = GeoService(http_client=mock_client)
 
-            # Immediate second call during 15s backoff window skips HTTP call
-            res2 = asyncio.run(_fetch_nominatim(mock_client, 51.5142, -0.0885))
-            self.assertFalse(res2[5])
-            self.assertEqual(mock_client.get.call_count, 1)
+        res1 = asyncio.run(geo.fetch_nominatim(51.5142, -0.0885))
+        self.assertFalse(res1[5])
+        self.assertEqual(mock_client.get.call_count, 1)
+
+        # Immediate second call during 15s backoff window skips HTTP call
+        res2 = asyncio.run(geo.fetch_nominatim(51.5142, -0.0885))
+        self.assertFalse(res2[5])
+        self.assertEqual(mock_client.get.call_count, 1)
 
 
 class TestWalkSession(unittest.TestCase):
@@ -301,34 +297,34 @@ class TestAudioPruningAndAuth(unittest.TestCase):
             for i in range(5):
                 f = tmp_path / f"clip_{i}.wav"
                 f.write_bytes(pcm_to_wav_bytes(b"\x00\x00" * 100))
-                # Set distinct mtimes
                 mtime = 1000.0 + i
-                import os
-
                 os.utime(f, (mtime, mtime))
 
-            with patch("hear.gemini.AUDIO_DIR", tmp_path):
-                prune_old_audio_files(max_files=3)
-
+            prune_old_audio_files(tmp_path, max_files=3)
             remaining = sorted(p.name for p in tmp_path.glob("*.wav"))
             self.assertEqual(remaining, ["clip_2.wav", "clip_3.wav", "clip_4.wav"])
 
-    def test_verify_token(self) -> None:
+    def test_verify_token_and_env_reader(self) -> None:
         self.assertTrue(verify_token("secret123", "secret123"))
         self.assertFalse(verify_token("wrong", "secret123"))
         self.assertFalse(verify_token("", "secret123"))
 
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dotenv = Path(tmpdir) / ".env"
+            dotenv.write_text('HEAR_AUTH_TOKEN="from_dotenv"\n', encoding="utf-8")
+            env = EnvReader(dotenv_path=dotenv, environ={"GEMINI_API_KEY": "from_env"})
+            auth = AuthSettings(env)
+            self.assertEqual(auth.expected_token(), "from_dotenv")
+            self.assertEqual(env.get("GEMINI_API_KEY"), "from_env")
+
     def test_api_coordinate_validation_and_duplicate_narrate(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            test_db = HearDB(Path(tmpdir) / "hear.db")
-            test_mgr = SessionManager(store=test_db)
-            client = TestClient(app)
-            with (
-                patch("hear.app.get_expected_auth_token", return_value="test-token"),
-                patch("hear.app.db", test_db),
-                patch("hear.logging_utils.db", test_db),
-                patch("hear.app.session_manager", test_mgr),
-            ):
+            test_app = create_app(
+                data_dir=Path(tmpdir),
+                auth_token="test-token",
+                configure_logs=False,
+            )
+            with TestClient(test_app) as client:
                 # Unauthorized without token
                 r_unauth = client.get("/api/state")
                 self.assertEqual(r_unauth.status_code, 401)
@@ -343,7 +339,8 @@ class TestAudioPruningAndAuth(unittest.TestCase):
                 self.assertEqual(r_bad_coords.status_code, 422)
 
                 # Duplicate /api/narrate or /api/chat while is_generating is True -> 409 Conflict
-                sess = test_mgr.get("testclient")
+                container = test_app.state.container
+                sess = container.session_manager.get("testclient")
                 sess.is_generating = True
                 try:
                     r_conflict = client.post(
@@ -363,7 +360,7 @@ class TestAudioPruningAndAuth(unittest.TestCase):
                     sess.is_generating = False
 
                 # HTTP 4xx errors were persisted to SQLite events
-                events = test_db.get_recent_events(limit=20)
+                events = container.db.get_recent_events(limit=20)
                 error_statuses = [
                     ev["payload"].get("status_code")
                     for ev in events
@@ -371,20 +368,25 @@ class TestAudioPruningAndAuth(unittest.TestCase):
                 ]
                 self.assertIn(401, error_statuses)
                 self.assertIn(409, error_statuses)
-            test_db.close()
 
     def test_empty_gemini_response_raises_502(self) -> None:
         fake_resp = httpx.Response(
             200,
             json={"candidates": [{"finishReason": "SAFETY", "content": {"parts": []}}]},
         )
-        with (
-            patch("hear.gemini.get_api_key", return_value="fake-key"),
-            patch("hear.gemini._post_gemini_with_retry", new=AsyncMock(return_value=fake_resp)),
-        ):
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.is_closed = False
+        mock_http.post.return_value = fake_resp
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gemini = GeminiClient(
+                audio_dir=Path(tmpdir),
+                api_key="fake-key",
+                http_client=mock_http,
+            )
             with self.assertRaises(HTTPException) as ctx:
                 asyncio.run(
-                    call_gemini_text(
+                    gemini.generate_text(
                         contents=[GeminiContent(role="user", parts=[GeminiPart(text="Hello")])],
                         system_prompt="System",
                         model="gemini-3.8-flash",
@@ -403,15 +405,18 @@ class TestAudioPruningAndAuth(unittest.TestCase):
                 ]
             },
         )
-        with (
-            patch("hear.gemini.get_api_key", return_value="fake-key"),
-            patch(
-                "hear.gemini._post_gemini_with_retry",
-                new=AsyncMock(side_effect=[bad_json_resp, bad_b64_resp]),
-            ),
-        ):
-            self.assertIsNone(asyncio.run(call_gemini_tts("Hello")))
-            self.assertIsNone(asyncio.run(call_gemini_tts("Hello")))
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.is_closed = False
+        mock_http.post.side_effect = [bad_json_resp, bad_b64_resp]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gemini = GeminiClient(
+                audio_dir=Path(tmpdir),
+                api_key="fake-key",
+                http_client=mock_http,
+            )
+            self.assertIsNone(asyncio.run(gemini.generate_tts("Hello")))
+            self.assertIsNone(asyncio.run(gemini.generate_tts("Hello")))
 
     def test_config_manager_atomic_save_and_corrupt_yaml_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -423,8 +428,6 @@ class TestAudioPruningAndAuth(unittest.TestCase):
 
             # Write invalid YAML to disk and bump mtime -> falls back to last valid config
             cfg_path.write_text(":::invalid_yaml: [unclosed", encoding="utf-8")
-            import os
-
             os.utime(cfg_path, (time.time() + 10.0, time.time() + 10.0))
             self.assertEqual(mgr.get().system_prompt, "Initial prompt")
 
@@ -432,14 +435,16 @@ class TestAudioPruningAndAuth(unittest.TestCase):
         with self.assertRaises(ValidationError):
             GeminiConfig(model="../bad/model")
 
-    def test_resolve_data_dir_default_and_override(self) -> None:
-        with patch.dict("os.environ", {}, clear=False):
-            self.assertEqual(resolve_data_dir(""), PROJECT_ROOT / "data")
+    def test_resolve_data_dir_and_app_paths(self) -> None:
+        self.assertEqual(resolve_data_dir(""), PROJECT_ROOT / "data")
         with tempfile.TemporaryDirectory() as tmpdir:
             expected = Path(tmpdir).resolve()
             self.assertEqual(resolve_data_dir(tmpdir), expected)
             with patch.dict("os.environ", {"HEAR_DATA_DIR": tmpdir}):
                 self.assertEqual(resolve_data_dir(), expected)
+            paths = AppPaths.from_env(data_dir=tmpdir)
+            self.assertEqual(paths.db_path, expected / "hear.db")
+            self.assertEqual(paths.audio_dir, expected / "audio")
 
 
 class TestSQLitePersistenceAndEvents(unittest.TestCase):
@@ -462,47 +467,49 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
                 city="London",
                 nearby_features=["Royal Exchange"],
             )
-            fake_narration = GeminiTextResult(
-                text="Cornhill sat at the heart of London's mercantile credit networks.",
-                search_queries=["Cornhill London credit history"],
-                sources=[GroundingSource(title="British History", uri="https://example.com/bh")],
-            )
-            fake_reply = GeminiTextResult(
-                text="The Royal Exchange was founded by Thomas Gresham in 1565.",
-                search_queries=[],
-                sources=[],
+            fake_gemini = _FakeGeminiClient(
+                [
+                    GeminiTextResult(
+                        text="Cornhill sat at the heart of London's mercantile credit networks.",
+                        search_queries=["Cornhill London credit history"],
+                        sources=[
+                            GroundingSource(title="British History", uri="https://example.com/bh")
+                        ],
+                    ),
+                    GeminiTextResult(
+                        text="The Royal Exchange was founded by Thomas Gresham in 1565.",
+                        search_queries=[],
+                        sources=[],
+                    ),
+                ]
             )
 
-            mgr1 = SessionManager(store=store)
+            mgr1 = SessionManager(store=store, gemini=fake_gemini)
             elmo = mgr1.get("elmo")
-            with patch(
-                "hear.session.call_gemini_text",
-                new=AsyncMock(side_effect=[fake_narration, fake_reply]),
-            ):
-                asyncio.run(
-                    elmo.execute_narration_turn(
-                        config=cfg,
-                        lat=51.5142,
-                        lon=-0.0885,
-                        heading=90.0,
-                        geo=geo,
-                        reason="manual",
-                    )
+            asyncio.run(
+                elmo.execute_narration_turn(
+                    config=cfg,
+                    lat=51.5142,
+                    lon=-0.0885,
+                    heading=90.0,
+                    geo=geo,
+                    reason="manual",
                 )
-                asyncio.run(
-                    elmo.execute_chat_turn(
-                        config=cfg,
-                        cleaned_message="Who founded the Royal Exchange?",
-                        lat=51.5142,
-                        lon=-0.0885,
-                        short_label="Cornhill, City of London",
-                    )
+            )
+            asyncio.run(
+                elmo.execute_chat_turn(
+                    config=cfg,
+                    cleaned_message="Who founded the Royal Exchange?",
+                    lat=51.5142,
+                    lon=-0.0885,
+                    short_label="Cornhill, City of London",
                 )
+            )
 
             original_session_id = elmo.session_id
 
             # Simulate server restart with a brand-new SessionManager backed by the same DB
-            mgr2 = SessionManager(store=store)
+            mgr2 = SessionManager(store=store, gemini=fake_gemini)
             restored = mgr2.get("elmo")
             self.assertEqual(restored.session_id, original_session_id)
             self.assertEqual(len(restored.ui_messages), 3)
@@ -525,7 +532,7 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
             # Reset marks the previous session inactive so restart starts fresh
             restored.reset()
             self.assertNotEqual(restored.session_id, original_session_id)
-            mgr3 = SessionManager(store=store)
+            mgr3 = SessionManager(store=store, gemini=fake_gemini)
             fresh = mgr3.get("elmo")
             self.assertEqual(fresh.ui_messages, [])
 
@@ -567,8 +574,6 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
             mgr1.save(AppConfig(system_prompt="Saved via UI"))
 
             # Simulate fresh container where baked-in config.yaml is older than the DB override
-            import os
-
             older_ts = time.time() - 3600.0
             cfg_path.write_text("system_prompt: Baked In Default\n", encoding="utf-8")
             os.utime(cfg_path, (older_ts, older_ts))
@@ -579,15 +584,12 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
 
     def test_client_events_endpoint_and_pruning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = HearDB(Path(tmpdir) / "hear.db")
-            mgr = SessionManager(store=store)
-            client = TestClient(app)
-            with (
-                patch("hear.app.get_expected_auth_token", return_value="test-token"),
-                patch("hear.app.db", store),
-                patch("hear.logging_utils.db", store),
-                patch("hear.app.session_manager", mgr),
-            ):
+            test_app = create_app(
+                data_dir=Path(tmpdir),
+                auth_token="test-token",
+                configure_logs=False,
+            )
+            with TestClient(test_app) as client:
                 resp = client.post(
                     "/api/events",
                     headers={"x-hear-token": "test-token", "x-hear-client-id": "elmo"},
@@ -609,21 +611,21 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
                 self.assertEqual(resp.status_code, 200)
                 self.assertEqual(resp.json()["accepted"], 2)
 
-            events = store.get_recent_events(client_id="elmo", limit=10)
-            self.assertEqual(len(events), 2)
-            self.assertEqual(events[0]["source"], EventSource.FRONTEND)
+                store = test_app.state.container.db
+                events = store.get_recent_events(client_id="elmo", limit=10)
+                self.assertEqual(len(events), 2)
+                self.assertEqual(events[0]["source"], EventSource.FRONTEND)
 
-            # Insert an expired event and verify pruning removes only the old row
-            store.record_event(
-                source=EventSource.BACKEND,
-                level=EventLevel.INFO,
-                event_type="stale_event",
-                ts=time.time() - 40 * 86400.0,
-            )
-            pruned = store.prune_old_events(max_age_days=30)
-            self.assertEqual(pruned, 1)
-            self.assertEqual(len(store.get_recent_events(limit=10)), 2)
-            store.close()
+                # Insert an expired event and verify pruning removes only the old row
+                store.record_event(
+                    source=EventSource.BACKEND,
+                    level=EventLevel.INFO,
+                    event_type="stale_event",
+                    ts=time.time() - 40 * 86400.0,
+                )
+                pruned = store.prune_old_events(max_age_days=30)
+                self.assertEqual(pruned, 1)
+                self.assertEqual(len(store.get_recent_events(client_id="elmo", limit=10)), 2)
 
 
 if __name__ == "__main__":

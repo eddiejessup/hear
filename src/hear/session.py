@@ -6,11 +6,11 @@ import re
 import time
 import uuid
 from datetime import UTC, datetime
+from typing import Protocol
 
-from hear.db import HearDB, PersistedSessionState, db
-from hear.gemini import call_gemini_text, call_gemini_tts
+from hear.db import HearDB, PersistedSessionState
 from hear.geo import compass_bearing_label, haversine_meters
-from hear.logging_utils import log_event_async
+from hear.logging_utils import EventLogger
 from hear.models.config import AppConfig, LensConfig
 from hear.models.events import BackendEventType
 from hear.models.gemini import GeminiContent, GeminiPart, GeminiTextResult
@@ -35,6 +35,25 @@ LOCATION_SAMPLE_MIN_INTERVAL_SECONDS = 30.0
 _SAFE_CLIENT_ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
 
+class TextAndTtsClient(Protocol):
+    async def generate_text(
+        self,
+        contents: list[GeminiContent],
+        system_prompt: str,
+        model: str,
+        temperature: float = 0.75,
+        enable_google_search: bool = True,
+    ) -> GeminiTextResult: ...
+
+    async def generate_tts(
+        self,
+        text: str,
+        tts_model: str = "gemini-3.8-flash-tts",
+        voice_name: str = "Charon",
+        style_prompt: str = "",
+    ) -> str | None: ...
+
+
 def sanitize_client_id(raw_client_id: str | None) -> str:
     if not raw_client_id:
         return "default"
@@ -43,9 +62,20 @@ def sanitize_client_id(raw_client_id: str | None) -> str:
 
 
 class WalkSession:
-    def __init__(self, client_id: str = "default", store: HearDB | None = None) -> None:
+    def __init__(
+        self,
+        client_id: str = "default",
+        *,
+        store: HearDB | None = None,
+        gemini: TextAndTtsClient | None = None,
+        event_logger: EventLogger | None = None,
+    ) -> None:
         self.client_id: str = sanitize_client_id(client_id)
         self._store: HearDB | None = store
+        self._gemini: TextAndTtsClient | None = gemini
+        self._events: EventLogger = (
+            event_logger if event_logger is not None else EventLogger(store=store)
+        )
         self.lock = asyncio.Lock()
         self.session_id: str = ""
         self.started_at: float = 0.0
@@ -67,9 +97,19 @@ class WalkSession:
 
     @classmethod
     def from_persisted(
-        cls, persisted: PersistedSessionState, store: HearDB | None = None
+        cls,
+        persisted: PersistedSessionState,
+        *,
+        store: HearDB | None = None,
+        gemini: TextAndTtsClient | None = None,
+        event_logger: EventLogger | None = None,
     ) -> WalkSession:
-        session = cls(client_id=persisted.client_id, store=store)
+        session = cls(
+            client_id=persisted.client_id,
+            store=store,
+            gemini=gemini,
+            event_logger=event_logger,
+        )
         session.session_id = persisted.session_id
         session.started_at = persisted.started_at
         session.last_active_at = persisted.last_active_at
@@ -201,12 +241,15 @@ class WalkSession:
         user_prompt_text: str,
     ) -> tuple[GeminiTextResult, str | None, float, int, int | None]:
         """Run a Gemini text + optional TTS turn and append it to session history."""
+        if self._gemini is None:
+            raise RuntimeError("WalkSession requires a GeminiClient to run generation turns.")
+
         gemini_cfg = config.gemini
         user_turn = GeminiContent(role="user", parts=[GeminiPart(text=user_prompt_text)])
         trial_contents: list[GeminiContent] = [*self.gemini_contents, user_turn]
 
         t_llm = time.monotonic()
-        llm_result = await call_gemini_text(
+        llm_result = await self._gemini.generate_text(
             contents=trial_contents,
             system_prompt=config.system_prompt,
             model=gemini_cfg.model,
@@ -219,7 +262,7 @@ class WalkSession:
         tts_latency_ms: int | None = None
         if gemini_cfg.tts_enabled:
             t_tts = time.monotonic()
-            audio_url = await call_gemini_tts(
+            audio_url = await self._gemini.generate_tts(
                 text=llm_result.text,
                 tts_model=gemini_cfg.tts_model,
                 voice_name=gemini_cfg.tts_voice,
@@ -463,11 +506,10 @@ class WalkSession:
                 llm_latency_ms=llm_latency_ms,
                 tts_latency_ms=tts_latency_ms,
             )
-        await log_event_async(
+        await self._events.log_async(
             BackendEventType.NARRATION_COMPLETED,
             session_id=self.session_id,
             client_id=self.client_id,
-            target_db=self._store,
             persist=self._store is not None,
             message_id=msg_record.id,
             reason=reason,
@@ -545,11 +587,10 @@ class WalkSession:
                 llm_latency_ms=llm_latency_ms,
                 tts_latency_ms=tts_latency_ms,
             )
-        await log_event_async(
+        await self._events.log_async(
             BackendEventType.CHAT_COMPLETED,
             session_id=self.session_id,
             client_id=self.client_id,
-            target_db=self._store,
             persist=self._store is not None,
             message_id=assistant_msg_ui.id,
             model=config.gemini.model,
@@ -563,14 +604,21 @@ class WalkSession:
 
 
 class SessionManager:
-    """Manages isolated WalkSession instances per client_id, backed by SQLite."""
+    """Manages isolated WalkSession instances per client_id, backed by an optional HearDB."""
 
     def __init__(
-        self, max_sessions: int = MAX_ACTIVE_SESSIONS, store: HearDB | None = None
+        self,
+        *,
+        max_sessions: int = MAX_ACTIVE_SESSIONS,
+        store: HearDB | None = None,
+        gemini: TextAndTtsClient | None = None,
+        event_logger: EventLogger | None = None,
     ) -> None:
         self._sessions: dict[str, WalkSession] = {}
         self._max_sessions = max_sessions
         self._store = store
+        self._gemini = gemini
+        self._events = event_logger if event_logger is not None else EventLogger(store=store)
 
     def get(self, raw_client_id: str | None) -> WalkSession:
         client_id = sanitize_client_id(raw_client_id)
@@ -589,12 +637,19 @@ class SessionManager:
                 else None
             )
             if persisted is not None:
-                walk_session = WalkSession.from_persisted(persisted, store=self._store)
+                walk_session = WalkSession.from_persisted(
+                    persisted,
+                    store=self._store,
+                    gemini=self._gemini,
+                    event_logger=self._events,
+                )
             else:
-                walk_session = WalkSession(client_id=client_id, store=self._store)
+                walk_session = WalkSession(
+                    client_id=client_id,
+                    store=self._store,
+                    gemini=self._gemini,
+                    event_logger=self._events,
+                )
             self._sessions[client_id] = walk_session
         walk_session.last_active_at = time.time()
         return walk_session
-
-
-session_manager = SessionManager(store=db)

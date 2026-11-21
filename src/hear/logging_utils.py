@@ -8,7 +8,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
-from hear.db import HearDB, db
+from hear.db import HearDB
 from hear.models.events import BackendEventType, EventLevel, EventSource
 
 _LEVEL_TO_SEVERITY = {
@@ -19,7 +19,7 @@ _LEVEL_TO_SEVERITY = {
     logging.CRITICAL: "CRITICAL",
 }
 
-_EVENT_LEVEL_TO_PY_LEVEL: dict[EventLevel, int] = {
+_EVENT_LEVEL_TO_PY = {
     EventLevel.DEBUG: logging.DEBUG,
     EventLevel.INFO: logging.INFO,
     EventLevel.WARN: logging.WARNING,
@@ -65,83 +65,80 @@ def configure_logging(level: int = logging.INFO) -> None:
     hear_logger.propagate = False
 
 
-_event_logger = logging.getLogger("hear.events")
+class EventLogger:
+    """Emits structured backend logs and optionally persists them to an injected HearDB."""
 
+    def __init__(self, store: HearDB | None = None, logger_name: str = "hear.events") -> None:
+        self._store = store
+        self._logger = logging.getLogger(logger_name)
 
-def log_event(
-    event_type: BackendEventType | str,
-    *,
-    level: EventLevel = EventLevel.INFO,
-    session_id: str | None = None,
-    client_id: str | None = None,
-    persist: bool = True,
-    target_db: HearDB | None = None,
-    **payload: Any,
-) -> None:
-    """Emit a structured backend log line and optionally persist it to SQLite events."""
-    py_level = _EVENT_LEVEL_TO_PY_LEVEL.get(level, logging.INFO)
-    event_name = str(event_type)
-    _event_logger.log(
-        py_level,
-        event_name,
-        extra={
-            "event_type": event_name,
-            "session_id": session_id,
-            "client_id": client_id,
-            "payload": payload,
-        },
-    )
-    if persist:
-        store = target_db or db
-        try:
-            store.record_event(
-                source=EventSource.BACKEND,
-                level=level,
-                event_type=event_type,
-                payload=payload,
-                session_id=session_id,
-                client_id=client_id,
-                ts=time.time(),
-            )
-        except Exception as exc:  # noqa: BLE001
-            _event_logger.warning("Failed to persist event %s to SQLite: %s", event_name, exc)
+    def log(
+        self,
+        event_type: BackendEventType | str,
+        *,
+        level: EventLevel = EventLevel.INFO,
+        session_id: str | None = None,
+        client_id: str | None = None,
+        persist: bool = True,
+        **payload: Any,
+    ) -> None:
+        py_level = _EVENT_LEVEL_TO_PY.get(level, logging.INFO)
+        self._logger.log(
+            py_level,
+            str(event_type),
+            extra={
+                "event_type": str(event_type),
+                "session_id": session_id,
+                "client_id": client_id,
+                "payload": payload,
+            },
+        )
+        if persist and self._store is not None:
+            try:
+                self._store.record_event(
+                    source=EventSource.BACKEND,
+                    level=level,
+                    event_type=event_type,
+                    payload=payload,
+                    session_id=session_id,
+                    client_id=client_id,
+                    ts=time.time(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning("Failed to persist event %s to SQLite: %s", event_type, exc)
 
-
-async def log_event_async(
-    event_type: BackendEventType | str,
-    *,
-    level: EventLevel = EventLevel.INFO,
-    session_id: str | None = None,
-    client_id: str | None = None,
-    persist: bool = True,
-    target_db: HearDB | None = None,
-    **payload: Any,
-) -> None:
-    """Async wrapper offloading SQLite event persistence off the event loop."""
-    py_level = _EVENT_LEVEL_TO_PY_LEVEL.get(level, logging.INFO)
-    event_name = str(event_type)
-    _event_logger.log(
-        py_level,
-        event_name,
-        extra={
-            "event_type": event_name,
-            "session_id": session_id,
-            "client_id": client_id,
-            "payload": payload,
-        },
-    )
-    if persist:
-        store = target_db or db
-        try:
-            await asyncio.to_thread(
-                store.record_event,
-                source=EventSource.BACKEND,
-                level=level,
-                event_type=event_type,
-                payload=payload,
-                session_id=session_id,
-                client_id=client_id,
-                ts=time.time(),
-            )
-        except Exception as exc:  # noqa: BLE001
-            _event_logger.warning("Failed to persist event %s to SQLite: %s", event_name, exc)
+    async def log_async(
+        self,
+        event_type: BackendEventType | str,
+        *,
+        level: EventLevel = EventLevel.INFO,
+        session_id: str | None = None,
+        client_id: str | None = None,
+        persist: bool = True,
+        **payload: Any,
+    ) -> None:
+        py_level = _EVENT_LEVEL_TO_PY.get(level, logging.INFO)
+        self._logger.log(
+            py_level,
+            str(event_type),
+            extra={
+                "event_type": str(event_type),
+                "session_id": session_id,
+                "client_id": client_id,
+                "payload": payload,
+            },
+        )
+        if persist and self._store is not None:
+            try:
+                await asyncio.to_thread(
+                    self._store.record_event,
+                    source=EventSource.BACKEND,
+                    level=level,
+                    event_type=event_type,
+                    payload=payload,
+                    session_id=session_id,
+                    client_id=client_id,
+                    ts=time.time(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._logger.warning("Failed to persist event %s to SQLite: %s", event_type, exc)

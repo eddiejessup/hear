@@ -9,9 +9,8 @@ from pathlib import Path
 import yaml
 from pydantic import ValidationError
 
-from hear.db import HearDB, db
+from hear.db import HearDB
 from hear.models.config import AppConfig
-from hear.paths import CONFIG_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +100,3 @@ class ConfigManager:
 
         self._cache = new_config
         return self._cache
-
-
-config_manager = ConfigManager(CONFIG_PATH, store=db)

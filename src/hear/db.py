@@ -19,7 +19,6 @@ from hear.models.session import (
     UIMessage,
     UserChatMessage,
 )
-from hear.paths import DB_PATH
 
 SCHEMA_VERSION = 1
 
@@ -825,6 +824,3 @@ class HearDB:
                 d["payload"] = _safe_json_loads(d.pop("payload_json", "{}"), {})
                 result.append(d)
             return result
-
-
-db = HearDB(DB_PATH)
