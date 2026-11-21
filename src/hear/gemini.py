@@ -159,17 +159,24 @@ class GeminiClient:
         model: str,
         temperature: float = 0.75,
         enable_google_search: bool = True,
+        thinking_level: str | None = None,
     ) -> GeminiTextResult:
         """Call Gemini generateContent REST API with multi-turn contents and Google Search."""
         api_key = self.get_api_key()
         url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
 
+        generation_config: dict[str, Any] = {}
+        # Gemini 4 deprecates custom sampling parameters (temperature is ignored server-side).
+        if not model.startswith("gemini-4"):
+            generation_config["temperature"] = temperature
+        if thinking_level:
+            generation_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
+
         payload: dict[str, Any] = {
             "contents": [c.model_dump() for c in contents],
-            "generationConfig": {
-                "temperature": temperature,
-            },
         }
+        if generation_config:
+            payload["generationConfig"] = generation_config
         if system_prompt:
             payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
         if enable_google_search:

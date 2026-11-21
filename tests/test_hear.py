@@ -35,6 +35,7 @@ class _FakeGeminiClient:
     def __init__(self, responses: list[GeminiTextResult], audio_url: str | None = None) -> None:
         self._responses = list(responses)
         self._audio_url = audio_url
+        self.text_calls: list[dict[str, object]] = []
 
     async def generate_text(
         self,
@@ -43,7 +44,16 @@ class _FakeGeminiClient:
         model: str,
         temperature: float = 0.75,
         enable_google_search: bool = True,
+        thinking_level: str | None = None,
     ) -> GeminiTextResult:
+        self.text_calls.append(
+            {
+                "model": model,
+                "temperature": temperature,
+                "enable_google_search": enable_google_search,
+                "thinking_level": thinking_level,
+            }
+        )
         return self._responses.pop(0)
 
     async def generate_tts(
@@ -484,8 +494,76 @@ class TestAudioPruningAndAuth(unittest.TestCase):
             self.assertEqual(mgr.get().system_prompt, "Initial prompt")
 
     def test_gemini_config_model_id_validation(self) -> None:
+        cfg = GeminiConfig()
+        self.assertEqual(cfg.model, "gemini-4-hydrogen")
+        self.assertEqual(cfg.thinking_level, "medium")
+
         with self.assertRaises(ValidationError):
             GeminiConfig(model="../bad/model")
+        with self.assertRaises(ValidationError):
+            GeminiConfig.model_validate({"thinking_level": "minimal"})
+
+    def test_gemini_generate_text_payload_thinking_and_temperature(self) -> None:
+        ok_resp = httpx.Response(
+            200,
+            json={"candidates": [{"content": {"parts": [{"text": "Historical note."}]}}]},
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.post.return_value = ok_resp
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gemini = GeminiClient(
+                audio_dir=Path(tmpdir),
+                api_key="fake-key",
+                http_client=mock_http,
+            )
+            asyncio.run(
+                gemini.generate_text(
+                    contents=[GeminiContent(role="user", parts=[GeminiPart(text="Hello")])],
+                    system_prompt="System",
+                    model="gemini-4-hydrogen",
+                    temperature=0.75,
+                    thinking_level="medium",
+                )
+            )
+            payload_g4 = mock_http.post.call_args.kwargs["json"]
+            self.assertEqual(
+                payload_g4["generationConfig"],
+                {"thinkingConfig": {"thinkingLevel": "medium"}},
+            )
+            self.assertNotIn("temperature", payload_g4["generationConfig"])
+
+            asyncio.run(
+                gemini.generate_text(
+                    contents=[GeminiContent(role="user", parts=[GeminiPart(text="Hello")])],
+                    system_prompt="System",
+                    model="gemini-3.8-flash",
+                    temperature=0.75,
+                    thinking_level="low",
+                )
+            )
+            payload_g38 = mock_http.post.call_args.kwargs["json"]
+            self.assertEqual(
+                payload_g38["generationConfig"],
+                {"temperature": 0.75, "thinkingConfig": {"thinkingLevel": "low"}},
+            )
+
+    def test_walk_session_forwards_thinking_level(self) -> None:
+        fake_gemini = _FakeGeminiClient(
+            [GeminiTextResult(text="Narration text.", search_queries=[], sources=[])]
+        )
+        sess = WalkSession(client_id="elmo", gemini=fake_gemini)
+        cfg = AppConfig(
+            gemini=GeminiConfig(
+                model="gemini-4-hydrogen",
+                thinking_level="high",
+                tts_enabled=False,
+            )
+        )
+        asyncio.run(sess.run_gemini_turn(cfg, "Tell me about this street."))
+        self.assertEqual(len(fake_gemini.text_calls), 1)
+        self.assertEqual(fake_gemini.text_calls[0]["model"], "gemini-4-hydrogen")
+        self.assertEqual(fake_gemini.text_calls[0]["thinking_level"], "high")
 
     def test_resolve_data_dir_and_app_paths(self) -> None:
         self.assertEqual(resolve_data_dir(""), PROJECT_ROOT / "data")

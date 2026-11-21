@@ -1,12 +1,16 @@
+from typing import Literal
+
 from pydantic import Field
 
 from hear.models.common import HearModel
 
 _MODEL_ID_PATTERN = r"^[a-zA-Z0-9._-]+$"
+ThinkingLevel = Literal["low", "medium", "high", "xhigh"]
 
 
 class GeminiConfig(HearModel):
-    model: str = Field(default="gemini-3.8-flash", pattern=_MODEL_ID_PATTERN)
+    model: str = Field(default="gemini-4-hydrogen", pattern=_MODEL_ID_PATTERN)
+    thinking_level: ThinkingLevel | None = Field(default="medium")
     temperature: float = Field(default=0.75, ge=0.0, le=2.0)
     enable_google_search: bool = True
     tts_enabled: bool = True

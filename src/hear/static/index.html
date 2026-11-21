@@ -153,11 +153,25 @@
         <div class="field-group">
           <label>Gemini Model</label>
           <select id="cfgModel">
-            <option value="gemini-3.8-flash">gemini-3.8-flash (Fast Workhorse)</option>
+            <option value="gemini-4-hydrogen">gemini-4-hydrogen (Fast Workhorse)</option>
+            <option value="gemini-3.8-flash">gemini-3.8-flash (Legacy Fast)</option>
             <option value="gemini-4-argon">gemini-4-argon (Frontier Fast)</option>
             <option value="gemini-4-carbon">gemini-4-carbon (Frontier Deep)</option>
           </select>
         </div>
+        <div class="field-group">
+          <label>Thinking Level</label>
+          <select id="cfgThinkingLevel">
+            <option value="low">Low (Fastest)</option>
+            <option value="medium">Medium (Balanced)</option>
+            <option value="high">High (Deep)</option>
+            <option value="xhigh">XHigh (Max, Hydrogen)</option>
+            <option value="">Model Default</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field-row">
         <div class="field-group">
           <label>TTS Voice (gemini-3.8-flash-tts)</label>
           <select id="cfgVoice">
@@ -166,6 +180,13 @@
             <option value="Fenrir">Fenrir</option>
             <option value="Puck">Puck</option>
             <option value="Aoede">Aoede</option>
+          </select>
+        </div>
+        <div class="field-group">
+          <label>Enable Gemini TTS</label>
+          <select id="cfgTtsEnabled">
+            <option value="true">Enabled (Gemini TTS)</option>
+            <option value="false">Disabled (Browser TTS / Text only)</option>
           </select>
         </div>
       </div>
@@ -181,18 +202,9 @@
         </div>
       </div>
 
-      <div class="field-row">
-        <div class="field-group">
-          <label>Max Silence Timer (sec)</label>
-          <input type="number" id="cfgMaxSilence" min="30" step="15" />
-        </div>
-        <div class="field-group">
-          <label>Enable Gemini TTS</label>
-          <select id="cfgTtsEnabled">
-            <option value="true">Enabled (Gemini TTS)</option>
-            <option value="false">Disabled (Browser TTS / Text only)</option>
-          </select>
-        </div>
+      <div class="field-group">
+        <label>Max Silence Timer (sec)</label>
+        <input type="number" id="cfgMaxSilence" min="30" step="15" />
       </div>
 
       <div class="field-group">

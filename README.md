@@ -1,6 +1,6 @@
 # Hear — Free-Roam Historical Walking Companion
 
-A personal, location-aware historical audio companion powered by **Gemini** (`gemini-3.8-flash` / `gemini-4-argon` with Google Search grounding + `gemini-3.8-flash-tts`).
+A personal, location-aware historical audio companion powered by **Gemini** (`gemini-4-hydrogen` / `gemini-4-argon` with Google Search grounding + `gemini-3.8-flash-tts`).
 
 ## Project Structure
 ```text

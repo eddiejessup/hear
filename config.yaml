@@ -1,5 +1,6 @@
 gemini:
-  model: gemini-3.8-flash
+  model: gemini-4-hydrogen
+  thinking_level: medium
   temperature: 0.75
   enable_google_search: true
   tts_enabled: true

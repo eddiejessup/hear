@@ -234,8 +234,9 @@ export function createDrawersController({
     setSelectValuePreservingCustom(
       document.getElementById("cfgModel"),
       g.model,
-      "gemini-3.8-flash"
+      "gemini-4-hydrogen"
     );
+    document.getElementById("cfgThinkingLevel").value = g.thinking_level || "";
     setSelectValuePreservingCustom(document.getElementById("cfgVoice"), g.tts_voice, "Charon");
     document.getElementById("cfgTtsEnabled").value = String(g.tts_enabled ?? true);
     document.getElementById("cfgTtsStyle").value = g.tts_style_prompt || "";
@@ -256,7 +257,8 @@ export function createDrawersController({
     const updated = JSON.parse(JSON.stringify(state.currentConfig || {}));
     updated.gemini = updated.gemini || {};
     updated.gemini.model =
-      document.getElementById("cfgModel").value || updated.gemini.model || "gemini-3.8-flash";
+      document.getElementById("cfgModel").value || updated.gemini.model || "gemini-4-hydrogen";
+    updated.gemini.thinking_level = document.getElementById("cfgThinkingLevel").value || null;
     updated.gemini.tts_voice =
       document.getElementById("cfgVoice").value || updated.gemini.tts_voice || "Charon";
     updated.gemini.tts_enabled = document.getElementById("cfgTtsEnabled").value === "true";

@@ -44,6 +44,7 @@ class TextAndTtsClient(Protocol):
         model: str,
         temperature: float = 0.75,
         enable_google_search: bool = True,
+        thinking_level: str | None = None,
     ) -> GeminiTextResult: ...
 
     async def generate_tts(
@@ -274,6 +275,7 @@ class WalkSession:
                 model=gemini_cfg.model,
                 temperature=gemini_cfg.temperature,
                 enable_google_search=gemini_cfg.enable_google_search,
+                thinking_level=gemini_cfg.thinking_level,
             )
             llm_latency_ms = int((time.monotonic() - t_llm) * 1000)
 
