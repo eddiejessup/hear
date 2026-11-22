@@ -5,6 +5,7 @@ import math
 import sqlite3
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -162,6 +163,17 @@ CREATE TABLE IF NOT EXISTS config_overrides (
 
 
 @dataclass(frozen=True)
+class EventRecord:
+    event_type: BackendEventType | str
+    source: EventSource = EventSource.BACKEND
+    level: EventLevel = EventLevel.INFO
+    session_id: str | None = None
+    client_id: str | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+    ts: float | None = None
+
+
+@dataclass(frozen=True)
 class SessionSnapshot:
     session_id: str
     client_id: str
@@ -185,6 +197,14 @@ class PersistedSessionState:
     used_lens_ids: list[str] = field(default_factory=list)
     ui_messages: list[UIMessage] = field(default_factory=list)
     gemini_contents: list[GeminiContent] = field(default_factory=list)
+
+
+def format_location_trigger_header(short_label: str | None) -> str:
+    return f"[LOCATION TRIGGER — {short_label or 'Unknown'}]"
+
+
+def format_user_chat_prompt(text: str, *, loc_prefix: str = "") -> str:
+    return f"{loc_prefix}User message: {text}"
 
 
 def _safe_json_loads(raw: str | None, fallback: Any) -> Any:
@@ -217,6 +237,100 @@ def _serialize_event_payload(payload: Any) -> str:
     preview_limit = max(0, MAX_EVENT_PAYLOAD_BYTES - 128)
     preview = raw.encode("utf-8")[:preview_limit].decode("utf-8", errors="ignore")
     return json.dumps({"_truncated": True, "_preview": preview})
+
+
+def _parse_grounding_sources(raw_json: str | None) -> list[GroundingSource]:
+    raw_sources = _safe_json_loads(raw_json, [])
+    if not isinstance(raw_sources, list):
+        return []
+    sources: list[GroundingSource] = []
+    for item in raw_sources:
+        if isinstance(item, dict) and item.get("uri"):
+            sources.append(
+                GroundingSource(
+                    title=str(item.get("title") or item["uri"]),
+                    uri=str(item["uri"]),
+                )
+            )
+    return sources
+
+
+def _row_to_ui_message(row: sqlite3.Row, *, audio_dir: Path | None) -> UIMessage:
+    role = str(row["role"])
+    text = str(row["text"])
+    if role == "user":
+        return UserChatMessage(
+            id=str(row["id"]),
+            timestamp=float(row["ts"]),
+            location_label=row["short_label"],
+            text=text,
+        )
+
+    loc: MessageLocation | None = None
+    if row["lat"] is not None and row["lon"] is not None and row["short_label"]:
+        loc = MessageLocation(
+            lat=float(row["lat"]),
+            lon=float(row["lon"]),
+            short_label=str(row["short_label"]),
+        )
+    lens: LensSummary | None = None
+    if row["lens_id"] and row["lens_name"]:
+        lens = LensSummary(id=str(row["lens_id"]), name=str(row["lens_name"]))
+
+    raw_queries = _safe_json_loads(row["search_queries_json"], [])
+    queries = [str(q) for q in raw_queries] if isinstance(raw_queries, list) else []
+
+    audio_url: str | None = row["audio_url"]
+    if audio_url and audio_dir is not None and not (audio_dir / Path(audio_url).name).exists():
+        audio_url = None
+
+    msg_type = str(row["type"])
+    return AssistantMessage(
+        id=str(row["id"]),
+        type="narration" if msg_type == "narration" else "chat_reply",
+        timestamp=float(row["ts"]),
+        location=loc,
+        lens=lens,
+        reason=row["reason"],
+        model=str(row["model"] or ""),
+        text=text,
+        audio_url=audio_url,
+        sources=_parse_grounding_sources(row["sources_json"]),
+        search_queries=queries,
+    )
+
+
+def _append_gemini_turn(contents: list[GeminiContent], row: sqlite3.Row) -> None:
+    role = str(row["role"])
+    text = str(row["text"])
+    prompt_text = row["prompt_text"]
+
+    if role == "user":
+        user_prompt = str(prompt_text) if prompt_text else format_user_chat_prompt(text)
+        contents.append(GeminiContent(role="user", parts=[GeminiPart(text=user_prompt)]))
+        return
+
+    if str(row["type"]) == "narration":
+        narration_prompt = (
+            str(prompt_text) if prompt_text else format_location_trigger_header(row["short_label"])
+        )
+        contents.append(GeminiContent(role="user", parts=[GeminiPart(text=narration_prompt)]))
+    contents.append(GeminiContent(role="model", parts=[GeminiPart(text=text)]))
+
+
+def _row_to_trigger_location(row: sqlite3.Row) -> TriggerLocation | None:
+    if (
+        row["last_trigger_lat"] is None
+        or row["last_trigger_lon"] is None
+        or not row["last_trigger_label"]
+    ):
+        return None
+    return TriggerLocation(
+        lat=float(row["last_trigger_lat"]),
+        lon=float(row["last_trigger_lon"]),
+        short_label=str(row["last_trigger_label"]),
+        timestamp=float(row["last_trigger_ts"] or row["last_active_at"]),
+    )
 
 
 class HearDB:
@@ -309,11 +423,11 @@ class HearDB:
             return
         with self._lock:
             conn = self._connect()
-            conn.execute(
-                "UPDATE sessions SET is_active = 0, last_active_at = ? WHERE session_id = ?",
-                (time.time(), session_id),
-            )
-            conn.commit()
+            with conn:
+                conn.execute(
+                    "UPDATE sessions SET is_active = 0, last_active_at = ? WHERE session_id = ?",
+                    (time.time(), session_id),
+                )
 
     def update_last_audio_ended_at(self, session_id: str, ts: float) -> None:
         if not session_id:
@@ -497,99 +611,9 @@ class HearDB:
 
             ui_messages: list[UIMessage] = []
             gemini_contents: list[GeminiContent] = []
-            for m in msg_rows:
-                role = str(m["role"])
-                msg_type = str(m["type"])
-                text = str(m["text"])
-                prompt_text = m["prompt_text"]
-
-                if role == "user":
-                    ui_messages.append(
-                        UserChatMessage(
-                            id=str(m["id"]),
-                            timestamp=float(m["ts"]),
-                            location_label=m["short_label"],
-                            text=text,
-                        )
-                    )
-                    user_prompt = str(prompt_text) if prompt_text else f"User message: {text}"
-                    gemini_contents.append(
-                        GeminiContent(role="user", parts=[GeminiPart(text=user_prompt)])
-                    )
-                else:
-                    loc: MessageLocation | None = None
-                    if m["lat"] is not None and m["lon"] is not None and m["short_label"]:
-                        loc = MessageLocation(
-                            lat=float(m["lat"]),
-                            lon=float(m["lon"]),
-                            short_label=str(m["short_label"]),
-                        )
-                    lens: LensSummary | None = None
-                    if m["lens_id"] and m["lens_name"]:
-                        lens = LensSummary(id=str(m["lens_id"]), name=str(m["lens_name"]))
-
-                    raw_sources = _safe_json_loads(m["sources_json"], [])
-                    sources: list[GroundingSource] = []
-                    if isinstance(raw_sources, list):
-                        for item in raw_sources:
-                            if isinstance(item, dict) and item.get("uri"):
-                                sources.append(
-                                    GroundingSource(
-                                        title=str(item.get("title") or item["uri"]),
-                                        uri=str(item["uri"]),
-                                    )
-                                )
-                    raw_queries = _safe_json_loads(m["search_queries_json"], [])
-                    queries = [str(q) for q in raw_queries] if isinstance(raw_queries, list) else []
-
-                    audio_url: str | None = m["audio_url"]
-                    if (
-                        audio_url
-                        and audio_dir is not None
-                        and not (audio_dir / Path(audio_url).name).exists()
-                    ):
-                        audio_url = None
-
-                    ui_messages.append(
-                        AssistantMessage(
-                            id=str(m["id"]),
-                            type="narration" if msg_type == "narration" else "chat_reply",
-                            timestamp=float(m["ts"]),
-                            location=loc,
-                            lens=lens,
-                            reason=m["reason"],
-                            model=str(m["model"] or ""),
-                            text=text,
-                            audio_url=audio_url,
-                            sources=sources,
-                            search_queries=queries,
-                        )
-                    )
-                    if msg_type == "narration":
-                        narration_prompt = (
-                            str(prompt_text)
-                            if prompt_text
-                            else f"[LOCATION TRIGGER — {m['short_label'] or 'Unknown'}]"
-                        )
-                        gemini_contents.append(
-                            GeminiContent(role="user", parts=[GeminiPart(text=narration_prompt)])
-                        )
-                    gemini_contents.append(
-                        GeminiContent(role="model", parts=[GeminiPart(text=text)])
-                    )
-
-            last_trig_loc: TriggerLocation | None = None
-            if (
-                row["last_trigger_lat"] is not None
-                and row["last_trigger_lon"] is not None
-                and row["last_trigger_label"]
-            ):
-                last_trig_loc = TriggerLocation(
-                    lat=float(row["last_trigger_lat"]),
-                    lon=float(row["last_trigger_lon"]),
-                    short_label=str(row["last_trigger_label"]),
-                    timestamp=float(row["last_trigger_ts"] or row["last_active_at"]),
-                )
+            for msg_row in msg_rows:
+                ui_messages.append(_row_to_ui_message(msg_row, audio_dir=audio_dir))
+                _append_gemini_turn(gemini_contents, msg_row)
 
             raw_lenses = _safe_json_loads(row["used_lens_ids_json"], [])
             used_lens_ids = [str(x) for x in raw_lenses] if isinstance(raw_lenses, list) else []
@@ -599,7 +623,7 @@ class HearDB:
                 client_id=client_id,
                 started_at=float(row["started_at"]),
                 last_active_at=float(row["last_active_at"]),
-                last_trigger_location=last_trig_loc,
+                last_trigger_location=_row_to_trigger_location(row),
                 last_trigger_time=(
                     float(row["last_trigger_ts"]) if row["last_trigger_ts"] is not None else None
                 ),
@@ -664,37 +688,34 @@ class HearDB:
     ) -> None:
         self.record_events_batch(
             [
-                {
-                    "ts": ts if ts is not None else time.time(),
-                    "source": source,
-                    "level": level,
-                    "session_id": session_id,
-                    "client_id": client_id,
-                    "event_type": event_type,
-                    "payload": payload or {},
-                }
+                EventRecord(
+                    ts=ts if ts is not None else time.time(),
+                    source=source,
+                    level=level,
+                    session_id=session_id,
+                    client_id=client_id,
+                    event_type=event_type,
+                    payload=payload or {},
+                )
             ]
         )
 
-    def record_events_batch(self, items: list[dict[str, Any]]) -> int:
+    def record_events_batch(self, items: Sequence[EventRecord]) -> int:
         if not items:
             return 0
         now = time.time()
-        rows: list[tuple[float, str, str, str | None, str | None, str, str]] = []
-        for item in items:
-            ts = _normalize_event_ts(item.get("ts"), now)
-            payload_json = _serialize_event_payload(item.get("payload"))
-            rows.append(
-                (
-                    ts,
-                    str(item.get("source") or EventSource.BACKEND),
-                    str(item.get("level") or EventLevel.INFO),
-                    str(item["session_id"]) if item.get("session_id") else None,
-                    str(item["client_id"]) if item.get("client_id") else None,
-                    str(item.get("event_type") or "unknown"),
-                    payload_json,
-                )
+        rows: list[tuple[float, str, str, str | None, str | None, str, str]] = [
+            (
+                _normalize_event_ts(item.ts, now),
+                str(item.source),
+                str(item.level),
+                item.session_id or None,
+                item.client_id or None,
+                str(item.event_type) or "unknown",
+                _serialize_event_payload(item.payload),
             )
+            for item in items
+        ]
         with self._lock:
             conn = self._connect()
             with conn:
@@ -749,34 +770,26 @@ class HearDB:
     def search_messages(
         self, query: str, *, client_id: str | None = None, limit: int = 20
     ) -> list[dict[str, Any]]:
+        clauses = ["messages_fts MATCH ?"]
+        params: list[Any] = [query]
+        if client_id:
+            clauses.append("m.client_id = ?")
+            params.append(client_id)
+        params.append(limit)
         with self._lock:
             conn = self._connect()
-            if client_id:
-                rows = conn.execute(
-                    """
-                    SELECT m.id, m.session_id, m.client_id, m.role, m.type, m.ts,
-                           m.short_label, m.lens_name, m.text
-                    FROM messages_fts f
-                    JOIN messages m ON m.seq = f.rowid
-                    WHERE messages_fts MATCH ? AND m.client_id = ?
-                    ORDER BY m.ts DESC
-                    LIMIT ?
-                    """,
-                    (query, client_id, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    """
-                    SELECT m.id, m.session_id, m.client_id, m.role, m.type, m.ts,
-                           m.short_label, m.lens_name, m.text
-                    FROM messages_fts f
-                    JOIN messages m ON m.seq = f.rowid
-                    WHERE messages_fts MATCH ?
-                    ORDER BY m.ts DESC
-                    LIMIT ?
-                    """,
-                    (query, limit),
-                ).fetchall()
+            rows = conn.execute(
+                f"""
+                SELECT m.id, m.session_id, m.client_id, m.role, m.type, m.ts,
+                       m.short_label, m.lens_name, m.text
+                FROM messages_fts f
+                JOIN messages m ON m.seq = f.rowid
+                WHERE {" AND ".join(clauses)}
+                ORDER BY m.ts DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
             return [dict(r) for r in rows]
 
     def get_recent_events(

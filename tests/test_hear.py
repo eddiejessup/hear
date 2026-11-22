@@ -17,7 +17,7 @@ from pydantic import ValidationError
 from hear.app import build_container, create_app
 from hear.auth import AuthSettings, EnvReader, verify_token
 from hear.config import ConfigManager
-from hear.db import HearDB
+from hear.db import EventRecord, HearDB
 from hear.debug import RuntimeDebugProvider
 from hear.gemini import GeminiClient, pcm_to_wav_bytes, prune_old_audio_files
 from hear.geo import GeoCache, GeoService, compass_bearing_label, haversine_meters
@@ -1013,22 +1013,22 @@ class TestSQLitePersistenceAndEvents(unittest.TestCase):
             now = time.time()
             store.record_events_batch(
                 [
-                    {
-                        "ts": (now - 10.0) * 1000.0,  # JS milliseconds
-                        "source": EventSource.FRONTEND,
-                        "level": EventLevel.INFO,
-                        "event_type": "js_ms_event",
-                        "client_id": "elmo",
-                        "payload": {"ok": True},
-                    },
-                    {
-                        "ts": now + 999999.0,  # Far future timestamp
-                        "source": EventSource.FRONTEND,
-                        "level": EventLevel.INFO,
-                        "event_type": "future_event",
-                        "client_id": "elmo",
-                        "payload": {"blob": "x" * 20000},
-                    },
+                    EventRecord(
+                        ts=(now - 10.0) * 1000.0,  # JS milliseconds
+                        source=EventSource.FRONTEND,
+                        level=EventLevel.INFO,
+                        event_type="js_ms_event",
+                        client_id="elmo",
+                        payload={"ok": True},
+                    ),
+                    EventRecord(
+                        ts=now + 999999.0,  # Far future timestamp
+                        source=EventSource.FRONTEND,
+                        level=EventLevel.INFO,
+                        event_type="future_event",
+                        client_id="elmo",
+                        payload={"blob": "x" * 20000},
+                    ),
                 ]
             )
             events = {e["event_type"]: e for e in store.get_recent_events(client_id="elmo")}

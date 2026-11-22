@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from hear.auth import AuthSettings, EnvReader, verify_token
 from hear.config import ConfigManager
-from hear.db import HearDB
+from hear.db import EventRecord, HearDB
 from hear.debug import RuntimeDebugProvider
 from hear.gemini import GeminiClient
 from hear.geo import GeoService
@@ -417,15 +417,15 @@ def create_app(
             return ClientEventsResponse(accepted=0)
 
         items = [
-            {
-                "ts": ev.ts,
-                "source": EventSource.FRONTEND,
-                "level": ev.level,
-                "session_id": ev.session_id or session.session_id,
-                "client_id": session.client_id,
-                "event_type": ev.event_type,
-                "payload": ev.payload,
-            }
+            EventRecord(
+                ts=ev.ts,
+                source=EventSource.FRONTEND,
+                level=ev.level,
+                session_id=ev.session_id or session.session_id,
+                client_id=session.client_id,
+                event_type=ev.event_type,
+                payload=ev.payload,
+            )
             for ev in req.events
         ]
         accepted = await asyncio.to_thread(c.db.record_events_batch, items)

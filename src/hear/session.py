@@ -12,7 +12,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from hear.db import HearDB, PersistedSessionState, SessionSnapshot
+from hear.db import (
+    HearDB,
+    PersistedSessionState,
+    SessionSnapshot,
+    format_location_trigger_header,
+    format_user_chat_prompt,
+)
 from hear.geo import compass_bearing_label, haversine_meters
 from hear.logging_utils import EventLogger, bind_event_context
 from hear.models.config import AppConfig, LensConfig
@@ -474,7 +480,7 @@ class WalkSession:
             f"\nAdditional user request for this stop: {custom_focus}" if custom_focus else ""
         )
         return (
-            f"[LOCATION TRIGGER — {geo.short_label}]\n"
+            f"{format_location_trigger_header(geo.short_label)}\n"
             f"Coordinates: {lat:.5f}, {lon:.5f}{heading_str}\n"
             f"Full address context: {geo.full_address}\n\n"
             f"Selected Lens ({lens.name}): {lens.prompt}"
@@ -615,7 +621,7 @@ class WalkSession:
             location_label=short_label,
             text=cleaned_message,
         )
-        user_prompt_text = f"{loc_prefix}User message: {cleaned_message}"
+        user_prompt_text = format_user_chat_prompt(cleaned_message, loc_prefix=loc_prefix)
         turn = await self.run_gemini_turn(config, user_prompt_text)
 
         location = (
