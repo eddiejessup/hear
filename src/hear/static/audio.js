@@ -15,12 +15,22 @@ export function createAudioController({
   let activeSpeechUtterance = null;
   let playRequestId = 0;
 
+  function cancelBrowserTts() {
+    activeSpeechUtterance = null;
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+  }
+
   function setupAudioEvents() {
     mainAudio.addEventListener("play", () => {
+      if (activeSpeechUtterance) {
+        cancelBrowserTts();
+      }
       patchSection("playback", { status: PlaybackState.PLAYING, lastError: null }, "audio_play");
     });
     mainAudio.addEventListener("pause", () => {
-      if (mainAudio.ended) return;
+      if (mainAudio.ended || activeSpeechUtterance) return;
       patchSection(
         "playback",
         { status: mainAudio.currentTime > 0 ? PlaybackState.PAUSED : PlaybackState.IDLE },
@@ -46,9 +56,12 @@ export function createAudioController({
 
   function playAudioUrl(url, title, subtitle) {
     const reqId = ++playRequestId;
+    cancelBrowserTts();
+    const rate = state.playback.speeds[state.playback.speedIdx];
     audioBar.classList.add("visible");
+    mainAudio.defaultPlaybackRate = rate;
     mainAudio.src = url;
-    mainAudio.playbackRate = state.playback.speeds[state.playback.speedIdx];
+    mainAudio.playbackRate = rate;
     patchSection(
       "playback",
       { currentTitle: title || "Historical Narration", lastError: null },
@@ -75,7 +88,9 @@ export function createAudioController({
 
   function speakBrowserTts(text) {
     if (!("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
+    playRequestId += 1;
+    mainAudio.pause();
+    cancelBrowserTts();
     const utter = new SpeechSynthesisUtterance(text);
     activeSpeechUtterance = utter;
     utter.rate = state.playback.speeds[state.playback.speedIdx];
@@ -109,6 +124,7 @@ export function createAudioController({
   function cycleSpeed() {
     const nextIdx = (state.playback.speedIdx + 1) % state.playback.speeds.length;
     const rate = state.playback.speeds[nextIdx];
+    mainAudio.defaultPlaybackRate = rate;
     mainAudio.playbackRate = rate;
     speedBtn.textContent = `${rate}x`;
     patchSection("playback", { speedIdx: nextIdx }, "audio_speed");
@@ -202,10 +218,7 @@ export function createAudioController({
     mainAudio.removeAttribute("src");
     mainAudio.load();
     audioBar.classList.remove("visible");
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
-    activeSpeechUtterance = null;
+    cancelBrowserTts();
     patchSection(
       "playback",
       { status: PlaybackState.IDLE, currentTitle: null, lastError: null },

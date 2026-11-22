@@ -7,7 +7,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
+from urllib.parse import quote
 
 import httpx
 from fastapi import HTTPException
@@ -22,6 +24,7 @@ from hear.debug import RuntimeDebugProvider
 from hear.gemini import GeminiClient, pcm_to_wav_bytes, prune_old_audio_files
 from hear.geo import GeoCache, GeoService, compass_bearing_label, haversine_meters
 from hear.logging_utils import EventLogger, bind_event_context, set_event_session_id
+from hear.models.api import NarrateRequest, PingRequest
 from hear.models.config import AppConfig, GeminiConfig, LensConfig, TriggersConfig
 from hear.models.events import BackendEventType, EventLevel, EventSource
 from hear.models.gemini import (
@@ -200,6 +203,63 @@ class TestWalkSession(unittest.TestCase):
         third = session.sample_lens(self.config)
         self.assertIn(third.id, {"econ", "pol"})
         self.assertEqual(len(session.used_lens_ids), 1)
+
+    def test_failed_gemini_turn_does_not_mutate_used_lens_ids(self) -> None:
+        class _FlakyGeminiClient:
+            def __init__(self) -> None:
+                self.should_fail = True
+
+            async def generate_text(
+                self,
+                contents: list[GeminiContent],
+                system_prompt: str,
+                model: str,
+                temperature: float = 0.75,
+                enable_google_search: bool = True,
+                thinking_level: str | None = None,
+            ) -> GeminiTextResult:
+                if self.should_fail:
+                    raise HTTPException(status_code=502, detail="Transient Gemini error")
+                return GeminiTextResult(text="Recovered narration.", search_queries=[], sources=[])
+
+            async def generate_tts(
+                self,
+                text: str,
+                tts_model: str = "gemini-3.8-flash-tts",
+                voice_name: str = "Charon",
+                style_prompt: str = "",
+            ) -> str | None:
+                return None
+
+        geo = GeoContext(
+            lat=51.5142,
+            lon=-0.0885,
+            short_label="Cornhill",
+            full_address="Cornhill, London",
+            road="Cornhill",
+            neighborhood="City",
+            city="London",
+        )
+        cfg = self.config.model_copy(update={"gemini": GeminiConfig(tts_enabled=False)})
+        flaky = _FlakyGeminiClient()
+        session = WalkSession("test_fail_lens", gemini=flaky)
+
+        # Failed turn on fresh session leaves used_lens_ids untouched
+        with self.assertRaises(HTTPException):
+            asyncio.run(session.execute_narration_turn(cfg, 51.5142, -0.0885, None, geo))
+        self.assertEqual(session.used_lens_ids, [])
+
+        # Failed turn when pool is exhausted does NOT clear used_lens_ids
+        session.used_lens_ids = ["econ", "pol"]
+        with self.assertRaises(HTTPException):
+            asyncio.run(session.execute_narration_turn(cfg, 51.5142, -0.0885, None, geo))
+        self.assertEqual(session.used_lens_ids, ["econ", "pol"])
+
+        # Subsequent successful turn resets the exhausted pool and records the chosen lens
+        flaky.should_fail = False
+        msg = asyncio.run(session.execute_narration_turn(cfg, 51.5142, -0.0885, None, geo))
+        assert msg.lens is not None
+        self.assertEqual(session.used_lens_ids, [msg.lens.id])
 
     def test_trigger_heuristics(self) -> None:
         session = WalkSession("test")
@@ -518,6 +578,275 @@ class TestAudioPruningAndAuth(unittest.TestCase):
                 )
             self.assertEqual(ctx.exception.status_code, 502)
             self.assertIn("SAFETY", str(ctx.exception.detail))
+
+    def test_thought_only_gemini_response_raises_502_and_excludes_thoughts(self) -> None:
+        thought_only_resp = httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "finishReason": "MAX_TOKENS",
+                        "content": {
+                            "parts": [
+                                {"text": "Internal chain-of-thought reasoning...", "thought": True}
+                            ]
+                        },
+                    }
+                ]
+            },
+        )
+        mixed_resp = httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "finishReason": "STOP",
+                        "content": {
+                            "parts": [
+                                {"text": "Secret reasoning...", "thought": True},
+                                {"text": "Visible historical narration."},
+                            ]
+                        },
+                    }
+                ]
+            },
+        )
+        mock_http = AsyncMock(spec=httpx.AsyncClient)
+        mock_http.post.side_effect = [thought_only_resp, mixed_resp]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gemini = GeminiClient(
+                audio_dir=Path(tmpdir),
+                api_key="fake-key",
+                http_client=mock_http,
+            )
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(
+                    gemini.generate_text(
+                        contents=[GeminiContent(role="user", parts=[GeminiPart(text="Hello")])],
+                        system_prompt="System",
+                        model="gemini-4-hydrogen",
+                        thinking_level="medium",
+                    )
+                )
+            self.assertEqual(ctx.exception.status_code, 502)
+            self.assertIn("MAX_TOKENS", str(ctx.exception.detail))
+
+            result = asyncio.run(
+                gemini.generate_text(
+                    contents=[GeminiContent(role="user", parts=[GeminiPart(text="Hello")])],
+                    system_prompt="System",
+                    model="gemini-4-hydrogen",
+                    thinking_level="medium",
+                )
+            )
+            self.assertEqual(result.text, "Visible historical narration.")
+
+    def test_ping_and_narrate_normalize_negative_gps_sentinels(self) -> None:
+        ping = PingRequest(
+            lat=51.5142,
+            lon=-0.0885,
+            accuracy=-1.0,
+            heading=-1.0,
+            speed=-1.0,
+        )
+        self.assertIsNone(ping.accuracy)
+        self.assertIsNone(ping.heading)
+        self.assertIsNone(ping.speed)
+
+        ping_non_finite = PingRequest(
+            lat=51.5142,
+            lon=-0.0885,
+            accuracy=float("nan"),
+            heading=365.0,
+            speed=float("inf"),
+        )
+        self.assertIsNone(ping_non_finite.accuracy)
+        self.assertIsNone(ping_non_finite.heading)
+        self.assertIsNone(ping_non_finite.speed)
+
+        ping_valid = PingRequest(
+            lat=51.5142,
+            lon=-0.0885,
+            accuracy=12.5,
+            heading=0.0,
+            speed=0.0,
+        )
+        self.assertEqual(ping_valid.accuracy, 12.5)
+        self.assertEqual(ping_valid.heading, 0.0)
+        self.assertEqual(ping_valid.speed, 0.0)
+
+        narrate = NarrateRequest(lat=51.5142, lon=-0.0885, heading=-1.0)
+        self.assertIsNone(narrate.heading)
+
+        with self.assertRaises(ValidationError):
+            PingRequest.model_validate({"lat": 51.5, "lon": -0.1, "heading": "invalid"})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            container = build_container(
+                data_dir=tmp_path,
+                config_path=tmp_path / "config.yaml",
+                env=EnvReader(environ={}),
+                allow_unauthenticated=True,
+            )
+            geo_ctx = GeoContext(
+                lat=51.5142,
+                lon=-0.0885,
+                short_label="Cornhill",
+                full_address="Cornhill, London",
+                road="Cornhill",
+                neighborhood="City",
+                city="London",
+            )
+            with patch.object(container.geo, "reverse_geocode", AsyncMock(return_value=geo_ctx)):
+                test_app = create_app(container=container, configure_logs=False)
+                with TestClient(test_app) as client:
+                    resp = client.post(
+                        "/api/ping",
+                        json={
+                            "lat": 51.5142,
+                            "lon": -0.0885,
+                            "accuracy": -1,
+                            "heading": -1,
+                            "speed": -1,
+                        },
+                    )
+                    self.assertEqual(resp.status_code, 200)
+                    loc = resp.json()["location"]
+                    self.assertIsNone(loc["accuracy"])
+                    self.assertIsNone(loc["heading"])
+                    self.assertIsNone(loc["speed"])
+
+    def test_cookie_auth_and_client_id_unquote_url_encoded_values(self) -> None:
+        special_token = "abc+def/123=45@secret:token"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            test_app = create_app(
+                data_dir=tmp_path,
+                config_path=tmp_path / "config.yaml",
+                env=EnvReader(environ={}),
+                auth_token=special_token,
+                configure_logs=False,
+            )
+            audio_file = test_app.state.container.paths.audio_dir / "clip.wav"
+            audio_file.write_bytes(pcm_to_wav_bytes(b"\x00\x00" * 10))
+
+            with TestClient(test_app) as client:
+                client.cookies.set("hear_token", quote(special_token, safe=""))
+                client.cookies.set("hear_client_id", quote("elmo/phone", safe=""))
+
+                state_resp = client.get("/api/state")
+                self.assertEqual(state_resp.status_code, 200)
+                self.assertIn("elmophone", test_app.state.container.session_manager._sessions)
+
+                audio_resp = client.get("/api/audio/clip.wav")
+                self.assertEqual(audio_resp.status_code, 200)
+
+        # Raw header containing literal %2B is NOT unquoted
+        literal_percent_token = "tok%2Ben"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            test_app = create_app(
+                data_dir=tmp_path,
+                config_path=tmp_path / "config.yaml",
+                env=EnvReader(environ={}),
+                auth_token=literal_percent_token,
+                configure_logs=False,
+            )
+            with TestClient(test_app) as client:
+                ok_resp = client.get(
+                    "/api/state",
+                    headers={"x-hear-token": literal_percent_token},
+                )
+                self.assertEqual(ok_resp.status_code, 200)
+
+    def test_http_events_preserve_session_id_across_middleware(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            container = build_container(
+                data_dir=tmp_path,
+                config_path=tmp_path / "config.yaml",
+                env=EnvReader(environ={}),
+                allow_unauthenticated=True,
+            )
+            test_app = create_app(container=container, configure_logs=False)
+            logged_requests: list[tuple[str, str | None, str | None]] = []
+            orig_emit = container.events._emit
+
+            def _capture_emit(
+                event_type: BackendEventType | str,
+                *,
+                level: EventLevel,
+                session_id: str | None,
+                client_id: str | None,
+                payload: dict[str, Any],
+            ) -> tuple[str | None, str | None]:
+                resolved_sid, resolved_cid = orig_emit(
+                    event_type,
+                    level=level,
+                    session_id=session_id,
+                    client_id=client_id,
+                    payload=payload,
+                )
+                if event_type == BackendEventType.HTTP_REQUEST:
+                    logged_requests.append(
+                        (str(payload.get("path", "")), resolved_sid, resolved_cid)
+                    )
+                return resolved_sid, resolved_cid
+
+            with (
+                patch.object(container.events, "_emit", side_effect=_capture_emit),
+                TestClient(test_app, raise_server_exceptions=False) as client,
+            ):
+                headers = {"x-hear-client-id": "elmo"}
+                state_resp = client.get("/api/state", headers=headers)
+                self.assertEqual(state_resp.status_code, 200)
+                first_sid = state_resp.json()["session_id"]
+
+                # HTTP_REQUEST for /api/state carries session_id & client_id via ContextVar
+                self.assertIn(("/api/state", first_sid, "elmo"), logged_requests)
+
+                # HTTP_ERROR for /api/narrate (400: no coords yet) persists with session_id
+                err_resp = client.post("/api/narrate", json={}, headers=headers)
+                self.assertEqual(err_resp.status_code, 400)
+
+                # HTTP_UNHANDLED_ERROR persists with session_id
+                with patch.object(
+                    container.geo,
+                    "reverse_geocode",
+                    AsyncMock(side_effect=RuntimeError("boom")),
+                ):
+                    crash_resp = client.post(
+                        "/api/ping",
+                        json={"lat": 51.5142, "lon": -0.0885},
+                        headers=headers,
+                    )
+                    self.assertEqual(crash_resp.status_code, 500)
+
+                # /api/session/reset updates ContextVar session_id for SESSION_RESET & HTTP_REQUEST
+                reset_resp = client.post("/api/session/reset", headers=headers)
+                self.assertEqual(reset_resp.status_code, 200)
+                new_sid = reset_resp.json()["session_id"]
+                self.assertNotEqual(new_sid, first_sid)
+                self.assertIn(("/api/session/reset", new_sid, "elmo"), logged_requests)
+
+                events = container.db.get_recent_events(client_id="elmo", limit=20)
+                http_errors = [
+                    ev for ev in events if ev["event_type"] == BackendEventType.HTTP_ERROR
+                ]
+                self.assertEqual(len(http_errors), 1)
+                self.assertEqual(http_errors[0]["session_id"], first_sid)
+
+                unhandled = [
+                    ev for ev in events if ev["event_type"] == BackendEventType.HTTP_UNHANDLED_ERROR
+                ]
+                self.assertEqual(len(unhandled), 1)
+                self.assertEqual(unhandled[0]["session_id"], first_sid)
+
+                resets = [ev for ev in events if ev["event_type"] == BackendEventType.SESSION_RESET]
+                self.assertEqual(len(resets), 1)
+                self.assertEqual(resets[0]["session_id"], new_sid)
 
     def test_tts_malformed_response_degrades_to_none(self) -> None:
         bad_json_resp = httpx.Response(200, content=b"not-json")

@@ -4,15 +4,18 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.requests import HTTPConnection
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from hear.auth import AuthSettings, EnvReader, verify_token
 from hear.config import ConfigManager
@@ -123,9 +126,125 @@ def build_container(
     )
 
 
-def _extract_client_id(request: Request) -> str:
-    raw_id = request.headers.get("x-hear-client-id") or request.cookies.get("hear_client_id")
+def _extract_client_id(conn: HTTPConnection) -> str:
+    raw_id = conn.headers.get("x-hear-client-id")
+    if not raw_id:
+        cookie_id = conn.cookies.get("hear_client_id")
+        raw_id = unquote(cookie_id) if cookie_id else None
     return sanitize_client_id(raw_id)
+
+
+class _AuthMiddleware:
+    """Pure ASGI auth middleware so request ContextVars stay in the same task."""
+
+    def __init__(self, app: ASGIApp, auth: AuthSettings) -> None:
+        self.app = app
+        self.auth = auth
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        conn = HTTPConnection(scope)
+        if not conn.url.path.startswith("/api/"):
+            await self.app(scope, receive, send)
+            return
+
+        expected = self.auth.expected_token()
+        if not expected:
+            if self.auth.is_unauthenticated_allowed():
+                await self.app(scope, receive, send)
+                return
+            resp = JSONResponse(
+                {
+                    "detail": (
+                        "Server authentication is not configured. "
+                        "Set HEAR_AUTH_TOKEN (or HEAR_ALLOW_UNAUTHENTICATED=1 for local dev)."
+                    )
+                },
+                status_code=503,
+            )
+            await resp(scope, receive, send)
+            return
+
+        provided = conn.headers.get("x-hear-token")
+        if not provided:
+            cookie_token = conn.cookies.get("hear_token")
+            provided = unquote(cookie_token) if cookie_token else ""
+        if not verify_token(provided, expected):
+            resp = JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            await resp(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+class _RequestLoggingMiddleware:
+    """Pure ASGI request logger that shares ContextVar state with downstream handlers."""
+
+    def __init__(self, app: ASGIApp, events: EventLogger) -> None:
+        self.app = app
+        self.events = events
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        t0 = time.monotonic()
+        conn = HTTPConnection(scope)
+        path = conn.url.path
+        method = str(scope.get("method", ""))
+        is_api = path.startswith("/api/")
+        client_id = _extract_client_id(conn) if is_api else None
+        status_code: int | None = None
+
+        async def send_wrapper(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = int(message["status"])
+            await send(message)
+
+        with bind_event_context(client_id=client_id):
+            try:
+                await self.app(scope, receive, send_wrapper)
+            except Exception as exc:
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                await self.events.log_async(
+                    BackendEventType.HTTP_UNHANDLED_ERROR,
+                    level=EventLevel.ERROR,
+                    method=method,
+                    path=path,
+                    latency_ms=latency_ms,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
+                raise
+
+            if is_api and status_code is not None:
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                # Persist authenticated API errors to SQLite; keep 401/503 probes and 2xx in stdout
+                if status_code >= 400:
+                    await self.events.log_async(
+                        BackendEventType.HTTP_ERROR,
+                        level=EventLevel.ERROR if status_code >= 500 else EventLevel.WARN,
+                        persist=status_code not in {401, 503},
+                        method=method,
+                        path=path,
+                        status_code=status_code,
+                        latency_ms=latency_ms,
+                    )
+                elif path != "/api/events":
+                    self.events.log(
+                        BackendEventType.HTTP_REQUEST,
+                        level=EventLevel.INFO,
+                        persist=False,
+                        method=method,
+                        path=path,
+                        status_code=status_code,
+                        latency_ms=latency_ms,
+                    )
 
 
 def create_app(
@@ -189,84 +308,8 @@ def create_app(
         set_event_session_id(session.session_id)
         return session
 
-    @app.middleware("http")
-    async def auth_middleware(
-        request: Request, call_next: Callable[[Request], Awaitable[Response]]
-    ) -> Response:
-        if not request.url.path.startswith("/api/"):
-            return await call_next(request)
-
-        expected = c.auth.expected_token()
-        if not expected:
-            if c.auth.is_unauthenticated_allowed():
-                return await call_next(request)
-            return JSONResponse(
-                {
-                    "detail": (
-                        "Server authentication is not configured. "
-                        "Set HEAR_AUTH_TOKEN (or HEAR_ALLOW_UNAUTHENTICATED=1 for local dev)."
-                    )
-                },
-                status_code=503,
-            )
-
-        provided = request.headers.get("x-hear-token") or request.cookies.get("hear_token") or ""
-        if not verify_token(provided, expected):
-            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-
-        return await call_next(request)
-
-    @app.middleware("http")
-    async def request_logging_middleware(
-        request: Request, call_next: Callable[[Request], Awaitable[Response]]
-    ) -> Response:
-        t0 = time.monotonic()
-        path = request.url.path
-        client_id = _extract_client_id(request) if path.startswith("/api/") else None
-        with bind_event_context(client_id=client_id):
-            try:
-                response = await call_next(request)
-            except Exception as exc:
-                latency_ms = int((time.monotonic() - t0) * 1000)
-                await c.events.log_async(
-                    BackendEventType.HTTP_UNHANDLED_ERROR,
-                    level=EventLevel.ERROR,
-                    client_id=client_id,
-                    method=request.method,
-                    path=path,
-                    latency_ms=latency_ms,
-                    error=str(exc),
-                    error_type=type(exc).__name__,
-                )
-                raise
-
-            latency_ms = int((time.monotonic() - t0) * 1000)
-            if path.startswith("/api/"):
-                status = response.status_code
-                # Persist authenticated API errors to SQLite; keep 401/503 probes and 2xx in stdout
-                if status >= 400:
-                    await c.events.log_async(
-                        BackendEventType.HTTP_ERROR,
-                        level=EventLevel.ERROR if status >= 500 else EventLevel.WARN,
-                        client_id=client_id,
-                        persist=status not in {401, 503},
-                        method=request.method,
-                        path=path,
-                        status_code=status,
-                        latency_ms=latency_ms,
-                    )
-                elif path != "/api/events":
-                    c.events.log(
-                        BackendEventType.HTTP_REQUEST,
-                        level=EventLevel.INFO,
-                        client_id=client_id,
-                        persist=False,
-                        method=request.method,
-                        path=path,
-                        status_code=status,
-                        latency_ms=latency_ms,
-                    )
-            return response
+    app.add_middleware(_AuthMiddleware, auth=c.auth)
+    app.add_middleware(_RequestLoggingMiddleware, events=c.events)
 
     @app.get("/", response_model=None)
     async def index() -> Response:
@@ -324,15 +367,11 @@ def create_app(
         if req.audio_just_ended:
             await c.events.log_async(
                 BackendEventType.AUDIO_ENDED_PING,
-                session_id=session.session_id,
-                client_id=session.client_id,
                 short_label=cur_loc.short_label,
             )
         if status.should_trigger:
             await c.events.log_async(
                 BackendEventType.AUTO_TRIGGER_READY,
-                session_id=session.session_id,
-                client_id=session.client_id,
                 reason=status.trigger_reason,
                 distance_moved_m=status.distance_moved_m,
                 silence_elapsed_s=status.silence_elapsed_s,
@@ -466,8 +505,6 @@ def create_app(
         saved = await asyncio.to_thread(c.config_manager.save, new_config)
         await c.events.log_async(
             BackendEventType.CONFIG_UPDATED,
-            session_id=session.session_id,
-            client_id=session.client_id,
             model=saved.gemini.model,
             auto_trigger_enabled=saved.triggers.auto_trigger_enabled,
             lens_count=len(saved.lenses),
@@ -486,8 +523,6 @@ def create_app(
             cfg = c.config_manager.get()
             await c.events.log_async(
                 BackendEventType.SESSION_RESET,
-                session_id=session.session_id,
-                client_id=session.client_id,
                 previous_session_id=previous_id,
             )
             return ResetSessionResponse(

@@ -1,6 +1,7 @@
+import math
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from hear.models.common import HearModel
 from hear.models.config import AppConfig
@@ -16,6 +17,26 @@ from hear.models.session import (
 )
 
 
+def _normalize_non_negative(value: Any) -> Any:
+    if (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and (not math.isfinite(value) or value < 0.0)
+    ):
+        return None
+    return value
+
+
+def _normalize_heading(value: Any) -> Any:
+    if (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and (not math.isfinite(value) or value < 0.0 or value > 360.0)
+    ):
+        return None
+    return value
+
+
 class PingRequest(HearModel):
     lat: float = Field(ge=-90.0, le=90.0)
     lon: float = Field(ge=-180.0, le=180.0)
@@ -26,6 +47,16 @@ class PingRequest(HearModel):
     is_paused_audio: bool = False
     audio_just_ended: bool = False
 
+    @field_validator("accuracy", "speed", mode="before")
+    @classmethod
+    def _clean_non_negative(cls, value: Any) -> Any:
+        return _normalize_non_negative(value)
+
+    @field_validator("heading", mode="before")
+    @classmethod
+    def _clean_heading(cls, value: Any) -> Any:
+        return _normalize_heading(value)
+
 
 class NarrateRequest(HearModel):
     lat: float | None = Field(default=None, ge=-90.0, le=90.0)
@@ -34,6 +65,11 @@ class NarrateRequest(HearModel):
     lens_id: str | None = Field(default=None, max_length=128)
     custom_focus: str | None = Field(default=None, max_length=1000)
     reason: str | None = Field(default="manual", max_length=128)
+
+    @field_validator("heading", mode="before")
+    @classmethod
+    def _clean_heading(cls, value: Any) -> Any:
+        return _normalize_heading(value)
 
 
 class ChatRequest(HearModel):
