@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from hear.http_client import ManagedAsyncClient
 from hear.logging_utils import EventLogger
 from hear.models.events import BackendEventType, EventLevel
 from hear.models.geo import GeoContext
@@ -110,26 +111,18 @@ class GeoService:
     ) -> None:
         self.cache = cache if cache is not None else GeoCache()
         self._events = event_logger if event_logger is not None else EventLogger(store=None)
-        self._http_client = http_client
-        self._owns_client = http_client is None
+        self._http = ManagedAsyncClient(
+            http_client=http_client,
+            timeout=6.0,
+            headers={"User-Agent": _USER_AGENT},
+        )
         self._nominatim_backoff_until: float = 0.0
 
     def _get_client(self) -> httpx.AsyncClient:
-        if not self._owns_client and self._http_client is not None:
-            return self._http_client
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(
-                timeout=6.0,
-                headers={"User-Agent": _USER_AGENT},
-            )
-            self._owns_client = True
-        return self._http_client
+        return self._http.get()
 
     async def close(self) -> None:
-        if self._owns_client and self._http_client is not None and not self._http_client.is_closed:
-            await self._http_client.aclose()
-        if self._owns_client:
-            self._http_client = None
+        await self._http.close()
 
     async def fetch_nominatim(self, lat: float, lon: float) -> tuple[str, str, str, str, str, bool]:
         short_label = f"{lat:.5f}, {lon:.5f}"

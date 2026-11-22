@@ -15,6 +15,7 @@ import httpx
 from fastapi import HTTPException
 
 from hear.auth import EnvReader
+from hear.http_client import ManagedAsyncClient
 from hear.logging_utils import EventLogger
 from hear.models.events import BackendEventType, EventLevel
 from hear.models.gemini import GeminiContent, GeminiTextResult, GeminiUsage, GroundingSource
@@ -83,6 +84,22 @@ def _write_and_prune_wav(audio_dir: Path, wav_path: Path, wav_bytes: bytes) -> N
     prune_old_audio_files(audio_dir)
 
 
+class _GeminiRequestError(Exception):
+    def __init__(
+        self,
+        *,
+        http_status: int,
+        detail: str,
+        log_fields: dict[str, Any],
+        warning_msg: str | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.http_status = http_status
+        self.detail = detail
+        self.log_fields = log_fields
+        self.warning_msg = warning_msg
+
+
 class GeminiClient:
     """Gemini text + TTS client owning its HTTP pool, API key lookup, and audio directory."""
 
@@ -99,22 +116,13 @@ class GeminiClient:
         self._api_key_override = api_key
         self._env = env
         self._events = event_logger if event_logger is not None else EventLogger(store=None)
-        self._http_client = http_client
-        self._owns_client = http_client is None
+        self._http = ManagedAsyncClient(http_client=http_client, timeout=90.0)
 
     def _get_client(self) -> httpx.AsyncClient:
-        if not self._owns_client and self._http_client is not None:
-            return self._http_client
-        if self._http_client is None or self._http_client.is_closed:
-            self._http_client = httpx.AsyncClient(timeout=90.0)
-            self._owns_client = True
-        return self._http_client
+        return self._http.get()
 
     async def close(self) -> None:
-        if self._owns_client and self._http_client is not None and not self._http_client.is_closed:
-            await self._http_client.aclose()
-        if self._owns_client:
-            self._http_client = None
+        await self._http.close()
 
     def get_api_key(self) -> str:
         if self._api_key_override is not None:
@@ -175,6 +183,77 @@ class GeminiClient:
 
         raise RuntimeError("Unreachable retry loop exit")
 
+    async def _log_gemini_error(
+        self,
+        *,
+        event_type: BackendEventType,
+        level: EventLevel,
+        model: str,
+        t0: float,
+        **fields: Any,
+    ) -> None:
+        await self._events.log_async(
+            event_type,
+            level=level,
+            model=model,
+            latency_ms=int((time.monotonic() - t0) * 1000),
+            **fields,
+        )
+
+    async def _post_generate_content(
+        self,
+        *,
+        model: str,
+        payload: dict[str, Any],
+        timeout: float,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        api_key = self.get_api_key()
+        url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
+
+        try:
+            resp = await self._post_with_retry(url, api_key, payload, timeout=timeout)
+        except httpx.TransportError as exc:
+            raise _GeminiRequestError(
+                http_status=502,
+                detail=f"Gemini network error ({model}): {exc}",
+                warning_msg=f"{model} network error: {exc}",
+                log_fields={"error": str(exc), "error_type": type(exc).__name__},
+            ) from exc
+
+        if resp.status_code != 200:
+            err_text = resp.text
+            try:
+                err_json = resp.json()
+                err_text = str(err_json.get("error", {}).get("message", err_text))
+            except ValueError:
+                pass
+            raise _GeminiRequestError(
+                http_status=resp.status_code,
+                detail=f"Gemini API error ({model}): {err_text}",
+                warning_msg=f"{model} returned {resp.status_code}: {err_text[:300]}",
+                log_fields={"status_code": resp.status_code, "error": err_text[:300]},
+            )
+
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise _GeminiRequestError(
+                http_status=502,
+                detail=f"Gemini returned invalid JSON ({model}): {exc}",
+                warning_msg=f"{model} returned invalid JSON: {exc}",
+                log_fields={"error": f"invalid_json: {exc}"},
+            ) from exc
+
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise _GeminiRequestError(
+                http_status=500,
+                detail="Gemini returned no candidates.",
+                log_fields={"error": "no_candidates"},
+            )
+
+        return data, candidates
+
     async def generate_text(
         self,
         contents: list[GeminiContent],
@@ -185,9 +264,6 @@ class GeminiClient:
         thinking_level: str | None = None,
     ) -> GeminiTextResult:
         """Call Gemini generateContent REST API with multi-turn contents and Google Search."""
-        api_key = self.get_api_key()
-        url = f"{GEMINI_API_BASE}/models/{model}:generateContent"
-
         generation_config: dict[str, Any] = {}
         # Gemini 4 deprecates custom sampling parameters (temperature is ignored server-side).
         if not model.startswith("gemini-4"):
@@ -207,64 +283,18 @@ class GeminiClient:
 
         t0 = time.monotonic()
         try:
-            resp = await self._post_with_retry(url, api_key, payload, timeout=60.0)
-        except httpx.TransportError as exc:
-            await self._events.log_async(
-                BackendEventType.GEMINI_TEXT_ERROR,
+            data, candidates = await self._post_generate_content(
+                model=model, payload=payload, timeout=60.0
+            )
+        except _GeminiRequestError as err:
+            await self._log_gemini_error(
+                event_type=BackendEventType.GEMINI_TEXT_ERROR,
                 level=EventLevel.ERROR,
                 model=model,
-                error=str(exc),
-                error_type=type(exc).__name__,
-                latency_ms=int((time.monotonic() - t0) * 1000),
+                t0=t0,
+                **err.log_fields,
             )
-            raise HTTPException(
-                status_code=502, detail=f"Gemini network error ({model}): {exc}"
-            ) from exc
-
-        if resp.status_code != 200:
-            err_text = resp.text
-            try:
-                err_json = resp.json()
-                err_text = str(err_json.get("error", {}).get("message", err_text))
-            except ValueError:
-                pass
-            await self._events.log_async(
-                BackendEventType.GEMINI_TEXT_ERROR,
-                level=EventLevel.ERROR,
-                model=model,
-                status_code=resp.status_code,
-                error=err_text[:300],
-                latency_ms=int((time.monotonic() - t0) * 1000),
-            )
-            raise HTTPException(
-                status_code=resp.status_code, detail=f"Gemini API error ({model}): {err_text}"
-            )
-
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            await self._events.log_async(
-                BackendEventType.GEMINI_TEXT_ERROR,
-                level=EventLevel.ERROR,
-                model=model,
-                error=f"invalid_json: {exc}",
-                latency_ms=int((time.monotonic() - t0) * 1000),
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=f"Gemini returned invalid JSON ({model}): {exc}",
-            ) from exc
-
-        candidates = data.get("candidates") or []
-        if not candidates:
-            await self._events.log_async(
-                BackendEventType.GEMINI_TEXT_ERROR,
-                level=EventLevel.ERROR,
-                model=model,
-                error="no_candidates",
-                latency_ms=int((time.monotonic() - t0) * 1000),
-            )
-            raise HTTPException(status_code=500, detail="Gemini returned no candidates.")
+            raise HTTPException(status_code=err.http_status, detail=err.detail) from err.__cause__
 
         candidate = candidates[0]
         parts = (candidate.get("content") or {}).get("parts") or []
@@ -276,13 +306,13 @@ class GeminiClient:
         full_text = "\n".join(t for t in text_chunks if t).strip()
         if not full_text:
             finish_reason = candidate.get("finishReason") or "UNKNOWN"
-            await self._events.log_async(
-                BackendEventType.GEMINI_TEXT_ERROR,
+            await self._log_gemini_error(
+                event_type=BackendEventType.GEMINI_TEXT_ERROR,
                 level=EventLevel.ERROR,
                 model=model,
+                t0=t0,
                 error="empty_text",
                 finish_reason=finish_reason,
-                latency_ms=int((time.monotonic() - t0) * 1000),
             )
             raise HTTPException(
                 status_code=502,
@@ -316,9 +346,6 @@ class GeminiClient:
         style_prompt: str = "",
     ) -> str | None:
         """Generate spoken audio using Gemini TTS and save as a WAV file in `audio_dir`."""
-        api_key = self.get_api_key()
-        url = f"{GEMINI_API_BASE}/models/{tts_model}:generateContent"
-
         clean_text = re.sub(r"[*_#`~]+", "", text).strip()
         part: dict[str, Any] = {"text": clean_text}
         if style_prompt.strip():
@@ -340,54 +367,18 @@ class GeminiClient:
 
         t0 = time.monotonic()
         try:
-            resp = await self._post_with_retry(url, api_key, payload, timeout=90.0)
-        except httpx.TransportError as exc:
-            logger.warning("[TTS Warning] %s network error: %s", tts_model, exc)
-            await self._events.log_async(
-                BackendEventType.GEMINI_TTS_ERROR,
+            _, candidates = await self._post_generate_content(
+                model=tts_model, payload=payload, timeout=90.0
+            )
+        except _GeminiRequestError as err:
+            if err.warning_msg:
+                logger.warning("[TTS Warning] %s", err.warning_msg)
+            await self._log_gemini_error(
+                event_type=BackendEventType.GEMINI_TTS_ERROR,
                 level=EventLevel.WARN,
                 model=tts_model,
-                error=str(exc),
-                error_type=type(exc).__name__,
-                latency_ms=int((time.monotonic() - t0) * 1000),
-            )
-            return None
-
-        if resp.status_code != 200:
-            logger.warning(
-                "[TTS Warning] %s returned %d: %s", tts_model, resp.status_code, resp.text[:300]
-            )
-            await self._events.log_async(
-                BackendEventType.GEMINI_TTS_ERROR,
-                level=EventLevel.WARN,
-                model=tts_model,
-                status_code=resp.status_code,
-                error=resp.text[:300],
-                latency_ms=int((time.monotonic() - t0) * 1000),
-            )
-            return None
-
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            logger.warning("[TTS Warning] %s returned invalid JSON: %s", tts_model, exc)
-            await self._events.log_async(
-                BackendEventType.GEMINI_TTS_ERROR,
-                level=EventLevel.WARN,
-                model=tts_model,
-                error=f"invalid_json: {exc}",
-                latency_ms=int((time.monotonic() - t0) * 1000),
-            )
-            return None
-
-        candidates = data.get("candidates") or []
-        if not candidates:
-            await self._events.log_async(
-                BackendEventType.GEMINI_TTS_ERROR,
-                level=EventLevel.WARN,
-                model=tts_model,
-                error="no_candidates",
-                latency_ms=int((time.monotonic() - t0) * 1000),
+                t0=t0,
+                **err.log_fields,
             )
             return None
 
@@ -413,20 +404,20 @@ class GeminiClient:
                     return f"/api/audio/{audio_id}.wav"
                 except (ValueError, TypeError, OSError, wave.Error) as exc:
                     logger.warning("[TTS Warning] %s audio decode/write failed: %s", tts_model, exc)
-                    await self._events.log_async(
-                        BackendEventType.GEMINI_TTS_ERROR,
+                    await self._log_gemini_error(
+                        event_type=BackendEventType.GEMINI_TTS_ERROR,
                         level=EventLevel.WARN,
                         model=tts_model,
+                        t0=t0,
                         error=f"decode_write_failed: {exc}",
-                        latency_ms=int((time.monotonic() - t0) * 1000),
                     )
                     return None
 
-        await self._events.log_async(
-            BackendEventType.GEMINI_TTS_ERROR,
+        await self._log_gemini_error(
+            event_type=BackendEventType.GEMINI_TTS_ERROR,
             level=EventLevel.WARN,
             model=tts_model,
+            t0=t0,
             error="no_inline_audio",
-            latency_ms=int((time.monotonic() - t0) * 1000),
         )
         return None
