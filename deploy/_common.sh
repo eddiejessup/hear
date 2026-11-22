@@ -12,8 +12,11 @@ if [[ -f ".env" ]]; then
   set +a
 fi
 
+# shellcheck disable=SC2034
 PROJECT="${GCP_PROJECT:-gen-lang-client-0743073374}"
+# shellcheck disable=SC2034
 REGION="${GCP_REGION:-europe-west1}"
+# shellcheck disable=SC2034
 LITESTREAM_BUCKET="${HEAR_LITESTREAM_BUCKET:-${PROJECT}-hear-data}"
 
 ensure_deploy_secrets() {

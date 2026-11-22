@@ -31,7 +31,7 @@ jobs:
       - name: Set up Biome
         uses: biomejs/setup-biome@v2
 
-      - name: Run static analysis (ruff + biome + ty)
+      - name: Run static analysis & tests (ruff + biome + shellcheck + ty + pytest)
         run: ./deploy/check.sh
 
       - name: Authenticate to Google Cloud

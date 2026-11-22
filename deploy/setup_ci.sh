@@ -11,7 +11,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 # 1. Load .env, GCP defaults, and required secrets
-# shellcheck disable=SC1091
+# shellcheck source=deploy/_common.sh
 source "$ROOT_DIR/deploy/_common.sh"
 
 GH_REPO="${GH_REPO:-eddiejessup/hear}"
