@@ -9,6 +9,7 @@ ENV UV_COMPILE_BYTECODE=1 \
     HEAR_NO_RELOAD=1 \
     HEAR_DATA_DIR=/data
 
+# hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

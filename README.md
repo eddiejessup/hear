@@ -11,7 +11,7 @@ hear/
 ├── pyproject.toml           # Python 3.15 project config (uv, ruff, ty, pytest)
 ├── deploy/
 │   ├── _common.sh           # Shared .env, GCP defaults & secret helpers for deploy scripts
-│   ├── check.sh             # Verification runner (ruff, biome, shellcheck, ty, pytest)
+│   ├── check.sh             # Verification runner (ruff, biome, shellcheck, actionlint, hadolint, gitleaks, deptry, ty, pytest)
 │   ├── deploy.sh            # Cloud Run deployment script (Gen2, Litestream-enabled)
 │   ├── entrypoint.sh        # Container startup wrapper (optional Litestream restore/replicate)
 │   ├── litestream.yml       # Litestream GCS replication config for hear.db
@@ -72,7 +72,7 @@ EOF
 uv run hear
 ```
 
-### 4. Static Analysis & Tests (`ruff`, `biome`, `shellcheck`, `ty`, `pytest`)
+### 4. Static Analysis & Tests
 ```bash
 ./deploy/check.sh
 ```
