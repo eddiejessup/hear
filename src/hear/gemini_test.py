@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from fastapi import HTTPException
-from pydantic import ValidationError
 
 from hear.db import HearDB
 from hear.gemini import GeminiClient, pcm_to_wav_bytes, prune_old_audio_files
@@ -23,7 +22,7 @@ from hear.models.gemini import (
     GroundingSource,
 )
 from hear.session import WalkSession
-from tests.helpers import FakeGeminiClient, make_geo
+from hear.testing import FakeGeminiClient, make_geo
 
 
 def test_prune_old_audio_files(tmp_path: Path) -> None:
@@ -73,17 +72,6 @@ def test_tts_malformed_response_degrades_to_none(tmp_path: Path) -> None:
     gemini = GeminiClient(audio_dir=tmp_path, api_key="fake-key", http_client=mock_http)
     assert asyncio.run(gemini.generate_tts("Hello")) is None
     assert asyncio.run(gemini.generate_tts("Hello")) is None
-
-
-def test_gemini_config_model_id_validation() -> None:
-    cfg = GeminiConfig()
-    assert cfg.model == "gemini-4-hydrogen"
-    assert cfg.thinking_level == "medium"
-
-    with pytest.raises(ValidationError):
-        GeminiConfig(model="../bad/model")
-    with pytest.raises(ValidationError):
-        GeminiConfig.model_validate({"thinking_level": "minimal"})
 
 
 def test_gemini_generate_text_payload_thinking_and_temperature(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ from hear.models.config import AppConfig, GeminiConfig
 from hear.models.gemini import GeminiTextResult
 from hear.models.session import CurrentLocation, TriggerLocation
 from hear.session import SessionManager, WalkSession, sanitize_client_id
-from tests.helpers import FakeGeminiClient
+from hear.testing import FakeGeminiClient
 
 
 def test_sanitize_client_id() -> None:

@@ -7,7 +7,7 @@ import pytest
 
 from hear.db import HearDB
 from hear.models.config import AppConfig
-from tests.helpers import make_walk_config
+from hear.testing import make_walk_config
 
 
 @pytest.fixture

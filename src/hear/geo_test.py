@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from hear.geo import GeoCache, GeoService, compass_bearing_label, haversine_meters
-from tests.helpers import make_geo
+from hear.testing import make_geo
 
 
 def test_haversine_meters() -> None:

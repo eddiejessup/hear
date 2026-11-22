@@ -28,6 +28,7 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hear"]
+exclude = ["**/*_test.py", "**/conftest.py", "**/testing.py"]
 
 [tool.ruff]
 line-length = 100
@@ -41,5 +42,5 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 python-version = "3.15"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
+testpaths = ["src/hear"]
+python_files = ["*_test.py"]

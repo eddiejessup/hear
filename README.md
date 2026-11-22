@@ -16,39 +16,39 @@ hear/
 │   ├── entrypoint.sh        # Container startup wrapper (optional Litestream restore/replicate)
 │   ├── litestream.yml       # Litestream GCS replication config for hear.db
 │   └── setup_ci.sh          # GCP APIs, Litestream GCS bucket, SA & GitHub Secrets provisioning
-├── src/
-│   └── hear/
-│       ├── __init__.py
-│       ├── app.py           # FastAPI application, AppContainer DI, endpoints & CLI entry point
-│       ├── auth.py          # Fail-closed token authentication & .env reader
-│       ├── config.py        # Hot-reloading config.yaml & SQLite override manager
-│       ├── db.py            # SQLite store (WAL, FTS5) for sessions, messages, events & config
-│       ├── debug.py         # Build, git commit, Cloud Run revision & runtime telemetry
-│       ├── gemini.py        # Gemini generateContent (with Google Search) & TTS client
-│       ├── geo.py           # Haversine distance, compass bearings & Nominatim reverse geocoding
-│       ├── http_client.py   # Shared lazy httpx.AsyncClient ownership wrapper
-│       ├── logging_utils.py # Structured JSON logging & EventLogger with ContextVar correlation
-│       ├── paths.py         # Project paths & directory initialization
-│       ├── session.py       # WalkSession state machine, lens sampling & trigger heuristics
-│       ├── models/
-│       │   ├── __init__.py
-│       │   ├── api.py       # HTTP request & response models
-│       │   ├── common.py    # Shared HearModel base configuration
-│       │   ├── config.py    # Configuration models (AppConfig, GeminiConfig, TriggersConfig, LensConfig)
-│       │   ├── events.py    # Event source, level & backend event type enums
-│       │   ├── gemini.py    # Gemini API payload, usage & grounding models
-│       │   ├── geo.py       # Reverse geocoding context model
-│       │   └── session.py   # Walk session, messages, trigger status & DebugInfo models
-│       └── static/
-│           ├── index.html   # Mobile web UI shell
-│           ├── app.css      # Dark-mode & OLED pocket overlay styles
-│           ├── app.js       # Main UI controller, GPS/ping loop & Pocket Mode
-│           ├── api.js       # Authenticated fetch wrapper & client/token cookie sync
-│           ├── audio.js     # Audio playback, MediaSession & silent keep-alive controller
-│           ├── drawers.js   # Simulator & config drawer controllers
-│           ├── state.js     # Reactive client state store & trigger-gate computation
-│           └── telemetry.js # Frontend event buffering, beacon flush & GPS staleness tracking
-└── tests/                   # Domain-organized pytest test suite
+└── src/
+    └── hear/
+        ├── __init__.py
+        ├── app.py           # FastAPI application, AppContainer DI, endpoints & CLI entry point
+        ├── auth.py          # Fail-closed token authentication & .env reader
+        ├── config.py        # Hot-reloading config.yaml & SQLite override manager
+        ├── db.py            # SQLite store (WAL, FTS5) for sessions, messages, events & config
+        ├── debug.py         # Build, git commit, Cloud Run revision & runtime telemetry
+        ├── gemini.py        # Gemini generateContent (with Google Search) & TTS client
+        ├── geo.py           # Haversine distance, compass bearings & Nominatim reverse geocoding
+        ├── http_client.py   # Shared lazy httpx.AsyncClient ownership wrapper
+        ├── logging_utils.py # Structured JSON logging & EventLogger with ContextVar correlation
+        ├── paths.py         # Project paths & directory initialization
+        ├── session.py       # WalkSession state machine, lens sampling & trigger heuristics
+        ├── *_test.py        # Co-located pytest unit tests alongside each module
+        ├── models/
+        │   ├── __init__.py
+        │   ├── api.py       # HTTP request & response models
+        │   ├── common.py    # Shared HearModel base configuration
+        │   ├── config.py    # Configuration models (AppConfig, GeminiConfig, TriggersConfig, LensConfig)
+        │   ├── events.py    # Event source, level & backend event type enums
+        │   ├── gemini.py    # Gemini API payload, usage & grounding models
+        │   ├── geo.py       # Reverse geocoding context model
+        │   └── session.py   # Walk session, messages, trigger status & DebugInfo models
+        └── static/
+            ├── index.html   # Mobile web UI shell
+            ├── app.css      # Dark-mode & OLED pocket overlay styles
+            ├── app.js       # Main UI controller, GPS/ping loop & Pocket Mode
+            ├── api.js       # Authenticated fetch wrapper & client/token cookie sync
+            ├── audio.js     # Audio playback, MediaSession & silent keep-alive controller
+            ├── drawers.js   # Simulator & config drawer controllers
+            ├── state.js     # Reactive client state store & trigger-gate computation
+            └── telemetry.js # Frontend event buffering, beacon flush & GPS staleness tracking
 ```
 
 ## Quick Start (Local + Tailscale)

@@ -1,105 +1,18 @@
 from __future__ import annotations
 
-import asyncio
+import re
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-import httpx
 from fastapi.testclient import TestClient
 
 from hear.app import build_container, create_app
-from hear.auth import AuthSettings, EnvReader, verify_token
-from hear.debug import RuntimeDebugProvider
-from hear.gemini import GeminiClient
-from hear.geo import GeoService
+from hear.auth import EnvReader
 from hear.models.config import AppConfig
 from hear.models.events import BackendEventType, EventLevel, EventSource
-from hear.paths import PROJECT_ROOT, AppPaths, resolve_data_dir
-from tests.helpers import make_test_app
-
-
-def test_verify_token_and_env_reader(tmp_path: Path) -> None:
-    assert verify_token("secret123", "secret123")
-    assert not verify_token("wrong", "secret123")
-    assert not verify_token("", "secret123")
-
-    dotenv = tmp_path / ".env"
-    dotenv.write_text('HEAR_AUTH_TOKEN="from_dotenv"\n', encoding="utf-8")
-    env = EnvReader(dotenv_path=dotenv, environ={"GEMINI_API_KEY": "from_env"})
-    auth = AuthSettings(env)
-    assert auth.expected_token() == "from_dotenv"
-    assert env.get("GEMINI_API_KEY") == "from_env"
-
-
-def test_resolve_data_dir_and_app_paths(tmp_path: Path) -> None:
-    assert resolve_data_dir("") == PROJECT_ROOT / "data"
-    expected = tmp_path.resolve()
-    assert resolve_data_dir(str(tmp_path)) == expected
-    with patch.dict("os.environ", {"HEAR_DATA_DIR": str(tmp_path)}):
-        assert resolve_data_dir() == expected
-    paths = AppPaths.from_env(data_dir=tmp_path)
-    assert paths.db_path == expected / "hear.db"
-    assert paths.audio_dir == expected / "audio"
-
-
-def test_app_paths_empty_data_dir_env_reader_and_ensure_dirs(tmp_path: Path) -> None:
-    root = tmp_path.resolve()
-    env_data = root / "from_env_reader"
-    missing_static = root / "nonexistent_static"
-
-    paths_empty = AppPaths.from_env(
-        data_dir="",
-        config_path=str(root / "custom.yaml"),
-        project_root=root,
-        static_dir=missing_static,
-    )
-    assert paths_empty.data_dir == root / "data"
-    assert paths_empty.config_path == root / "custom.yaml"
-    paths_empty.ensure_dirs()
-    assert paths_empty.data_dir.is_dir()
-    assert paths_empty.audio_dir.is_dir()
-    assert not missing_static.exists()
-
-    paths_from_env = AppPaths.from_env(
-        project_root=root,
-        env=EnvReader(environ={"HEAR_DATA_DIR": str(env_data)}),
-    )
-    assert paths_from_env.data_dir == env_data
-
-
-def test_runtime_debug_provider_resolves_git_lazily(tmp_path: Path) -> None:
-    paths = AppPaths.from_env(data_dir=tmp_path, project_root=tmp_path)
-    env = EnvReader(environ={})
-    with patch("hear.debug.subprocess.run") as mock_run:
-        mock_run.return_value.returncode = 0
-        mock_run.return_value.stdout = "abc1234\n"
-        provider = RuntimeDebugProvider(paths, env)
-        assert mock_run.call_count == 0
-
-        info1 = provider.get_info()
-        assert info1.git_commit == "abc1234"
-        assert mock_run.call_count == 2
-
-        # Subsequent calls reuse cached git metadata
-        info2 = provider.get_info()
-        assert info2.git_commit == "abc1234"
-        assert mock_run.call_count == 2
-
-
-def test_injected_http_client_not_replaced_or_closed(tmp_path: Path) -> None:
-    mock_http = AsyncMock(spec=httpx.AsyncClient)
-    mock_http.is_closed = True
-
-    geo = GeoService(http_client=mock_http)
-    assert geo._get_client() is mock_http
-    asyncio.run(geo.close())
-    mock_http.aclose.assert_not_awaited()
-
-    gemini = GeminiClient(audio_dir=tmp_path, api_key="k", http_client=mock_http)
-    assert gemini._get_client() is mock_http
-    asyncio.run(gemini.close())
-    mock_http.aclose.assert_not_awaited()
+from hear.paths import AppPaths
+from hear.testing import make_test_app
 
 
 def test_api_coordinate_validation_and_duplicate_narrate(tmp_path: Path) -> None:
@@ -235,3 +148,73 @@ def test_lifespan_shutdown_closes_db_even_if_geo_close_raises(tmp_path: Path) ->
         geo_close.assert_awaited_once()
         gemini_close.assert_awaited_once()
         assert container.db._conn is None
+
+
+def test_static_frontend_modules_served(tmp_path: Path) -> None:
+    test_app = make_test_app(tmp_path)
+    with TestClient(test_app) as client:
+        index_resp = client.get("/")
+        assert index_resp.status_code == 200
+        assert "/static/app.css" in index_resp.text
+        assert "/static/app.js" in index_resp.text
+
+        for asset in (
+            "/static/app.css",
+            "/static/state.js",
+            "/static/api.js",
+            "/static/telemetry.js",
+            "/static/audio.js",
+            "/static/drawers.js",
+            "/static/app.js",
+        ):
+            resp = client.get(asset)
+            assert resp.status_code == 200, f"Failed to serve {asset}"
+
+
+def test_static_frontend_dom_ids_and_imports_integrity() -> None:
+    static_dir = AppPaths.from_env().static_dir
+    html = (static_dir / "index.html").read_text(encoding="utf-8")
+    html_ids = set(re.findall(r'\bid="([^"]+)"', html))
+
+    exports_by_file: dict[Path, set[str]] = {}
+    for js_file in sorted(static_dir.glob("*.js")):
+        src = js_file.read_text(encoding="utf-8")
+        exported = set(
+            re.findall(
+                r"\bexport\s+(?:async\s+)?(?:function|const|let|var|class)\s+([A-Za-z_$][\w$]*)",
+                src,
+            )
+        )
+        for block in re.findall(r"\bexport\s*\{([^}]+)\}", src):
+            for item in block.split(","):
+                cleaned = item.strip()
+                if not cleaned:
+                    continue
+                parts = re.split(r"\s+as\s+", cleaned)
+                exported.add(parts[-1].strip())
+        exports_by_file[js_file.resolve()] = exported
+
+    for js_file in sorted(static_dir.glob("*.js")):
+        src = js_file.read_text(encoding="utf-8")
+        for rel_import in re.findall(r'from\s+["\'](\.[^"\']+)["\']', src):
+            target = (js_file.parent / rel_import).resolve()
+            assert target.is_file(), f"Broken relative JS import '{rel_import}' in {js_file.name}"
+        for names_block, rel_import in re.findall(
+            r'import\s*\{([^}]+)\}\s*from\s*["\'](\.[^"\']+)["\']',
+            src,
+        ):
+            target = (js_file.parent / rel_import).resolve()
+            target_exports = exports_by_file.get(target, set())
+            for item in names_block.split(","):
+                cleaned = item.strip()
+                if not cleaned:
+                    continue
+                imported_name = re.split(r"\s+as\s+", cleaned)[0].strip()
+                assert imported_name in target_exports, (
+                    f"Missing export '{imported_name}' in {target.name} "
+                    f"(imported by {js_file.name})"
+                )
+        for dom_id in re.findall(r'getElementById\(\s*["\']([^"\']+)["\']\s*\)', src):
+            assert dom_id in html_ids, (
+                f"Missing DOM id='{dom_id}' in index.html (referenced by {js_file.name})"
+            )
