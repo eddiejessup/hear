@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import time
 
+import pytest
+from fastapi import HTTPException
+
 from hear.models.config import AppConfig, GeminiConfig
 from hear.models.gemini import GeminiTextResult
 from hear.models.session import CurrentLocation, TriggerLocation
 from hear.session import SessionManager, WalkSession, sanitize_client_id
-from hear.testing import FakeGeminiClient
+from hear.testing import FakeGeminiClient, make_geo
 
 
 def test_sanitize_client_id() -> None:
@@ -27,6 +30,35 @@ def test_sample_lens_without_replacement_and_reset(walk_config: AppConfig) -> No
     third = session.sample_lens(walk_config)
     assert third.id in {"econ", "pol"}
     assert len(session.used_lens_ids) == 1
+
+
+def test_failed_gemini_turn_does_not_mutate_used_lens_ids(walk_config: AppConfig) -> None:
+    cfg = walk_config.model_copy(update={"gemini": GeminiConfig(tts_enabled=False)})
+    geo = make_geo()
+    fake_gemini = FakeGeminiClient(
+        [
+            HTTPException(status_code=502, detail="Transient Gemini error"),
+            HTTPException(status_code=502, detail="Transient Gemini error"),
+            GeminiTextResult(text="Recovered narration.", search_queries=[], sources=[]),
+        ]
+    )
+    session = WalkSession("test_fail_lens", gemini=fake_gemini)
+
+    # Failed turn on fresh session leaves used_lens_ids untouched
+    with pytest.raises(HTTPException):
+        asyncio.run(session.execute_narration_turn(cfg, 51.5142, -0.0885, None, geo))
+    assert session.used_lens_ids == []
+
+    # Failed turn when pool is exhausted does NOT clear used_lens_ids
+    session.used_lens_ids = ["econ", "pol"]
+    with pytest.raises(HTTPException):
+        asyncio.run(session.execute_narration_turn(cfg, 51.5142, -0.0885, None, geo))
+    assert session.used_lens_ids == ["econ", "pol"]
+
+    # Subsequent successful turn resets the exhausted pool and records the chosen lens
+    msg = asyncio.run(session.execute_narration_turn(cfg, 51.5142, -0.0885, None, geo))
+    assert msg.lens is not None
+    assert session.used_lens_ids == [msg.lens.id]
 
 
 def test_trigger_heuristics(walk_config: AppConfig) -> None:

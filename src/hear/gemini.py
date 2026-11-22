@@ -301,8 +301,6 @@ class GeminiClient:
         text_chunks = [
             str(p.get("text", "")) for p in parts if "text" in p and not p.get("thought", False)
         ]
-        if not text_chunks:
-            text_chunks = [str(p.get("text", "")) for p in parts if "text" in p]
         full_text = "\n".join(t for t in text_chunks if t).strip()
         if not full_text:
             finish_reason = candidate.get("finishReason") or "UNKNOWN"

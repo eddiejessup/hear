@@ -395,6 +395,14 @@ async function fetchInitialState() {
 // ---------------------------------------------------------------------------
 // GPS Tracking & Server Ping Loop
 // ---------------------------------------------------------------------------
+function normalizeNonNegative(val) {
+  return typeof val === "number" && Number.isFinite(val) && val >= 0 ? val : null;
+}
+
+function normalizeHeading(val) {
+  return typeof val === "number" && Number.isFinite(val) && val >= 0 && val <= 360 ? val : null;
+}
+
 function startGpsWatch() {
   if (!navigator.geolocation) {
     patchSection(
@@ -419,9 +427,9 @@ function startGpsWatch() {
           coords: {
             lat: pos.coords.latitude,
             lon: pos.coords.longitude,
-            accuracy: pos.coords.accuracy,
-            heading: pos.coords.heading,
-            speed: pos.coords.speed,
+            accuracy: normalizeNonNegative(pos.coords.accuracy),
+            heading: normalizeHeading(pos.coords.heading),
+            speed: normalizeNonNegative(pos.coords.speed),
             short_label: appState.gps.coords?.short_label,
           },
         },
@@ -478,9 +486,9 @@ async function sendPing(audioJustEnded = false) {
       body: JSON.stringify({
         lat: coords.lat,
         lon: coords.lon,
-        accuracy: coords.accuracy ?? null,
-        heading: coords.heading ?? null,
-        speed: coords.speed ?? null,
+        accuracy: normalizeNonNegative(coords.accuracy),
+        heading: normalizeHeading(coords.heading),
+        speed: normalizeNonNegative(coords.speed),
         is_playing_audio: playing,
         is_paused_audio: paused,
         audio_just_ended: audioJustEnded,
@@ -586,7 +594,7 @@ async function triggerNarration(reason = "manual") {
       body: JSON.stringify({
         lat: coords.lat,
         lon: coords.lon,
-        heading: coords.heading ?? null,
+        heading: normalizeHeading(coords.heading),
         lens_id: appState.selectedLensId || null,
         reason,
       }),

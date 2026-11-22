@@ -3,16 +3,19 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
+from urllib.parse import quote
 
 from fastapi.testclient import TestClient
 
 from hear.app import build_container, create_app
 from hear.auth import EnvReader
+from hear.gemini import pcm_to_wav_bytes
 from hear.models.config import AppConfig
 from hear.models.events import BackendEventType, EventLevel, EventSource
 from hear.paths import AppPaths
-from hear.testing import make_test_app
+from hear.testing import make_geo, make_test_app
 
 
 def test_api_coordinate_validation_and_duplicate_narrate(tmp_path: Path) -> None:
@@ -62,6 +65,143 @@ def test_api_coordinate_validation_and_duplicate_narrate(tmp_path: Path) -> None
         assert 401 not in error_statuses
         assert 409 in error_statuses
         assert 422 in error_statuses
+
+
+def test_ping_endpoint_accepts_negative_gps_sentinels(tmp_path: Path) -> None:
+    container = build_container(
+        data_dir=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        env=EnvReader(environ={}),
+        allow_unauthenticated=True,
+    )
+    with patch.object(container.geo, "reverse_geocode", AsyncMock(return_value=make_geo())):
+        test_app = create_app(container=container, configure_logs=False)
+        with TestClient(test_app) as client:
+            resp = client.post(
+                "/api/ping",
+                json={
+                    "lat": 51.5142,
+                    "lon": -0.0885,
+                    "accuracy": -1,
+                    "heading": -1,
+                    "speed": -1,
+                },
+            )
+            assert resp.status_code == 200
+            loc = resp.json()["location"]
+            assert loc["accuracy"] is None
+            assert loc["heading"] is None
+            assert loc["speed"] is None
+
+
+def test_cookie_auth_and_client_id_unquote_url_encoded_values(tmp_path: Path) -> None:
+    special_token = "abc+def/123=45@secret:token"
+    test_app = make_test_app(tmp_path / "special", auth_token=special_token)
+    audio_file = test_app.state.container.paths.audio_dir / "clip.wav"
+    audio_file.write_bytes(pcm_to_wav_bytes(b"\x00\x00" * 10))
+
+    with TestClient(test_app) as client:
+        client.cookies.set("hear_token", quote(special_token, safe=""))
+        client.cookies.set("hear_client_id", quote("elmo/phone", safe=""))
+
+        state_resp = client.get("/api/state")
+        assert state_resp.status_code == 200
+        assert "elmophone" in test_app.state.container.session_manager._sessions
+
+        audio_resp = client.get("/api/audio/clip.wav")
+        assert audio_resp.status_code == 200
+
+    # Raw header containing literal %2B is NOT unquoted
+    literal_percent_token = "tok%2Ben"
+    raw_app = make_test_app(tmp_path / "literal", auth_token=literal_percent_token)
+    with TestClient(raw_app) as client:
+        ok_resp = client.get(
+            "/api/state",
+            headers={"x-hear-token": literal_percent_token},
+        )
+        assert ok_resp.status_code == 200
+
+
+def test_http_events_preserve_session_id_across_middleware(tmp_path: Path) -> None:
+    container = build_container(
+        data_dir=tmp_path,
+        config_path=tmp_path / "config.yaml",
+        env=EnvReader(environ={}),
+        allow_unauthenticated=True,
+    )
+    test_app = create_app(container=container, configure_logs=False)
+    logged_requests: list[tuple[str, str | None, str | None]] = []
+    orig_emit = container.events._emit
+
+    def _capture_emit(
+        event_type: BackendEventType | str,
+        *,
+        level: EventLevel,
+        session_id: str | None,
+        client_id: str | None,
+        payload: dict[str, Any],
+    ) -> tuple[str | None, str | None]:
+        resolved_sid, resolved_cid = orig_emit(
+            event_type,
+            level=level,
+            session_id=session_id,
+            client_id=client_id,
+            payload=payload,
+        )
+        if event_type == BackendEventType.HTTP_REQUEST:
+            logged_requests.append((str(payload.get("path", "")), resolved_sid, resolved_cid))
+        return resolved_sid, resolved_cid
+
+    with (
+        patch.object(container.events, "_emit", side_effect=_capture_emit),
+        TestClient(test_app, raise_server_exceptions=False) as client,
+    ):
+        headers = {"x-hear-client-id": "elmo"}
+        state_resp = client.get("/api/state", headers=headers)
+        assert state_resp.status_code == 200
+        first_sid = state_resp.json()["session_id"]
+
+        # HTTP_REQUEST for /api/state carries session_id & client_id via ContextVar
+        assert ("/api/state", first_sid, "elmo") in logged_requests
+
+        # HTTP_ERROR for /api/narrate (400: no coords yet) persists with session_id
+        err_resp = client.post("/api/narrate", json={}, headers=headers)
+        assert err_resp.status_code == 400
+
+        # HTTP_UNHANDLED_ERROR persists with session_id
+        with patch.object(
+            container.geo,
+            "reverse_geocode",
+            AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            crash_resp = client.post(
+                "/api/ping",
+                json={"lat": 51.5142, "lon": -0.0885},
+                headers=headers,
+            )
+            assert crash_resp.status_code == 500
+
+        # /api/session/reset updates ContextVar session_id for SESSION_RESET & HTTP_REQUEST
+        reset_resp = client.post("/api/session/reset", headers=headers)
+        assert reset_resp.status_code == 200
+        new_sid = reset_resp.json()["session_id"]
+        assert new_sid != first_sid
+        assert ("/api/session/reset", new_sid, "elmo") in logged_requests
+
+        events = container.db.get_recent_events(client_id="elmo", limit=20)
+        http_errors = [ev for ev in events if ev["event_type"] == BackendEventType.HTTP_ERROR]
+        assert len(http_errors) == 1
+        assert http_errors[0]["session_id"] == first_sid
+
+        unhandled = [
+            ev for ev in events if ev["event_type"] == BackendEventType.HTTP_UNHANDLED_ERROR
+        ]
+        assert len(unhandled) == 1
+        assert unhandled[0]["session_id"] == first_sid
+
+        resets = [ev for ev in events if ev["event_type"] == BackendEventType.SESSION_RESET]
+        assert len(resets) == 1
+        assert resets[0]["session_id"] == new_sid
 
 
 def test_client_events_endpoint_and_pruning(tmp_path: Path) -> None:

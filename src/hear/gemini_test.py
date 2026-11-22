@@ -58,6 +58,65 @@ def test_empty_gemini_response_raises_502(tmp_path: Path) -> None:
     assert "SAFETY" in str(exc_info.value.detail)
 
 
+def test_thought_only_gemini_response_raises_502_and_excludes_thoughts(tmp_path: Path) -> None:
+    thought_only_resp = httpx.Response(
+        200,
+        json={
+            "candidates": [
+                {
+                    "finishReason": "MAX_TOKENS",
+                    "content": {
+                        "parts": [
+                            {"text": "Internal chain-of-thought reasoning...", "thought": True}
+                        ]
+                    },
+                }
+            ]
+        },
+    )
+    mixed_resp = httpx.Response(
+        200,
+        json={
+            "candidates": [
+                {
+                    "finishReason": "STOP",
+                    "content": {
+                        "parts": [
+                            {"text": "Secret reasoning...", "thought": True},
+                            {"text": "Visible historical narration."},
+                        ]
+                    },
+                }
+            ]
+        },
+    )
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+    mock_http.post.side_effect = [thought_only_resp, mixed_resp]
+
+    gemini = GeminiClient(audio_dir=tmp_path, api_key="fake-key", http_client=mock_http)
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            gemini.generate_text(
+                contents=[GeminiContent(role="user", parts=[GeminiPart(text="Hello")])],
+                system_prompt="System",
+                model="gemini-4-hydrogen",
+                thinking_level="medium",
+            )
+        )
+    assert exc_info.value.status_code == 502
+    assert "MAX_TOKENS" in str(exc_info.value.detail)
+
+    result = asyncio.run(
+        gemini.generate_text(
+            contents=[GeminiContent(role="user", parts=[GeminiPart(text="Hello")])],
+            system_prompt="System",
+            model="gemini-4-hydrogen",
+            thinking_level="medium",
+        )
+    )
+    assert result.text == "Visible historical narration."
+
+
 def test_tts_malformed_response_degrades_to_none(tmp_path: Path) -> None:
     bad_json_resp = httpx.Response(200, content=b"not-json")
     bad_b64_resp = httpx.Response(

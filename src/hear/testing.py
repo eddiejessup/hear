@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -12,8 +13,12 @@ from hear.models.geo import GeoContext
 
 
 class FakeGeminiClient:
-    def __init__(self, responses: list[GeminiTextResult], audio_url: str | None = None) -> None:
-        self._responses = list(responses)
+    def __init__(
+        self,
+        responses: Sequence[GeminiTextResult | Exception],
+        audio_url: str | None = None,
+    ) -> None:
+        self._responses: list[GeminiTextResult | Exception] = list(responses)
         self._audio_url = audio_url
         self.text_calls: list[dict[str, object]] = []
 
@@ -34,7 +39,10 @@ class FakeGeminiClient:
                 "thinking_level": thinking_level,
             }
         )
-        return self._responses.pop(0)
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     async def generate_tts(
         self,

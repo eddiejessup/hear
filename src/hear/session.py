@@ -358,7 +358,9 @@ class WalkSession:
             tts_latency_ms=tts_latency_ms,
         )
 
-    def sample_lens(self, config: AppConfig, requested_lens_id: str | None = None) -> LensConfig:
+    def _select_lens(
+        self, config: AppConfig, requested_lens_id: str | None = None
+    ) -> tuple[LensConfig, bool]:
         all_lenses = config.lenses
         enabled_lenses = [lens for lens in all_lenses if lens.enabled]
         if not enabled_lenses:
@@ -376,18 +378,24 @@ class WalkSession:
         if requested_lens_id:
             for lens in all_lenses:
                 if lens.id == requested_lens_id:
-                    if lens.id and lens.id not in self.used_lens_ids:
-                        self.used_lens_ids.append(lens.id)
-                    return lens
+                    return lens, False
 
         available = [lens for lens in enabled_lenses if lens.id not in self.used_lens_ids]
-        if not available:
-            self.used_lens_ids.clear()
+        reset_pool = not available
+        if reset_pool:
             available = enabled_lenses
 
-        chosen = random.choice(available)
-        if chosen.id:
-            self.used_lens_ids.append(chosen.id)
+        return random.choice(available), reset_pool
+
+    def _record_lens_used(self, lens: LensConfig, *, reset_pool: bool = False) -> None:
+        if reset_pool:
+            self.used_lens_ids.clear()
+        if lens.id and lens.id not in self.used_lens_ids:
+            self.used_lens_ids.append(lens.id)
+
+    def sample_lens(self, config: AppConfig, requested_lens_id: str | None = None) -> LensConfig:
+        chosen, reset_pool = self._select_lens(config, requested_lens_id=requested_lens_id)
+        self._record_lens_used(chosen, reset_pool=reset_pool)
         return chosen
 
     def compute_trigger_status(self, config: AppConfig) -> TriggerStatus:
@@ -553,7 +561,7 @@ class WalkSession:
         custom_focus: str | None = None,
         reason: str | None = "manual",
     ) -> AssistantMessage:
-        lens = self.sample_lens(config, requested_lens_id=requested_lens_id)
+        lens, reset_pool = self._select_lens(config, requested_lens_id=requested_lens_id)
         location_prompt = self.build_narration_prompt(
             lat=lat,
             lon=lon,
@@ -563,6 +571,7 @@ class WalkSession:
             custom_focus=custom_focus,
         )
         turn = await self.run_gemini_turn(config, location_prompt)
+        self._record_lens_used(lens, reset_pool=reset_pool)
 
         self.last_trigger_location = TriggerLocation(
             lat=lat,
