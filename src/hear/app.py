@@ -43,7 +43,7 @@ from hear.models.config import AppConfig
 from hear.models.events import BackendEventType, EventLevel, EventSource
 from hear.models.session import CurrentLocation
 from hear.paths import PROJECT_ROOT, AppPaths
-from hear.session import SessionManager, WalkSession, sanitize_client_id
+from hear.session import SessionBusyError, SessionManager, WalkSession, sanitize_client_id
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,15 @@ def build_container(
 def _extract_client_id(request: Request) -> str:
     raw_id = request.headers.get("x-hear-client-id") or request.cookies.get("hear_client_id")
     return sanitize_client_id(raw_id)
+
+
+@asynccontextmanager
+async def _acquire_generation_turn(session: WalkSession) -> AsyncGenerator[None]:
+    try:
+        async with session.generation_turn():
+            yield
+    except SessionBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def create_app(
@@ -347,35 +356,24 @@ def create_app(
     @app.post("/api/narrate")
     async def trigger_narration(req: NarrateRequest, request: Request) -> NarrateResponse:
         session = _get_session(request)
-        if session.is_generating or session.lock.locked():
-            raise HTTPException(
-                status_code=409,
-                detail="Narration or response generation is already in progress.",
-            )
-
-        async with session.lock:
+        async with _acquire_generation_turn(session):
             cfg = c.config_manager.get()
             lat, lon, heading = session.resolve_coords(req.lat, req.lon, req.heading)
 
             if lat is None or lon is None:
                 raise HTTPException(status_code=400, detail="No GPS coordinates available yet.")
 
-            session.is_generating = True
-            try:
-                geo = await c.geo.reverse_geocode(lat, lon)
-                msg_record = await session.execute_narration_turn(
-                    config=cfg,
-                    lat=lat,
-                    lon=lon,
-                    heading=heading,
-                    geo=geo,
-                    requested_lens_id=req.lens_id,
-                    custom_focus=req.custom_focus,
-                    reason=req.reason,
-                )
-            finally:
-                session.is_generating = False
-
+            geo = await c.geo.reverse_geocode(lat, lon)
+            msg_record = await session.execute_narration_turn(
+                config=cfg,
+                lat=lat,
+                lon=lon,
+                heading=heading,
+                geo=geo,
+                requested_lens_id=req.lens_id,
+                custom_focus=req.custom_focus,
+                reason=req.reason,
+            )
             return NarrateResponse(
                 message=msg_record,
                 trigger_status=session.compute_trigger_status(cfg),
@@ -388,33 +386,22 @@ def create_app(
             raise HTTPException(status_code=400, detail="Empty message.")
 
         session = _get_session(request)
-        if session.is_generating or session.lock.locked():
-            raise HTTPException(
-                status_code=409,
-                detail="Narration or response generation is already in progress.",
-            )
-
-        async with session.lock:
+        async with _acquire_generation_turn(session):
             cfg = c.config_manager.get()
             lat, lon, _ = session.resolve_coords(req.lat, req.lon)
 
-            session.is_generating = True
-            try:
-                short_label: str | None = None
-                if lat is not None and lon is not None:
-                    geo = await c.geo.reverse_geocode(lat, lon)
-                    short_label = geo.short_label
+            short_label: str | None = None
+            if lat is not None and lon is not None:
+                geo = await c.geo.reverse_geocode(lat, lon)
+                short_label = geo.short_label
 
-                user_msg_ui, assistant_msg_ui = await session.execute_chat_turn(
-                    config=cfg,
-                    cleaned_message=cleaned_message,
-                    lat=lat,
-                    lon=lon,
-                    short_label=short_label,
-                )
-            finally:
-                session.is_generating = False
-
+            user_msg_ui, assistant_msg_ui = await session.execute_chat_turn(
+                config=cfg,
+                cleaned_message=cleaned_message,
+                lat=lat,
+                lon=lon,
+                short_label=short_label,
+            )
             return ChatResponse(
                 user_message=user_msg_ui,
                 assistant_message=assistant_msg_ui,

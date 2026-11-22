@@ -5,11 +5,14 @@ import random
 import re
 import time
 import uuid
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Literal, Protocol
 
-from hear.db import HearDB, PersistedSessionState
+from hear.db import HearDB, PersistedSessionState, SessionSnapshot
 from hear.geo import compass_bearing_label, haversine_meters
 from hear.logging_utils import EventLogger, bind_event_context
 from hear.models.config import AppConfig, LensConfig
@@ -34,6 +37,19 @@ INITIAL_LOCATION_CHAT_GRACE_SECONDS = 15.0
 LOCATION_SAMPLE_MIN_DISTANCE_METERS = 20.0
 LOCATION_SAMPLE_MIN_INTERVAL_SECONDS = 30.0
 _SAFE_CLIENT_ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
+
+
+class SessionBusyError(Exception):
+    """Raised when a narration or chat generation turn is already in progress."""
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    llm: GeminiTextResult
+    audio_url: str | None
+    timestamp: float
+    llm_latency_ms: int
+    tts_latency_ms: int | None
 
 
 class TextAndTtsClient(Protocol):
@@ -254,11 +270,37 @@ class WalkSession:
         resolved_heading = heading if heading is not None else (cur.heading if cur else None)
         return resolved_lat, resolved_lon, resolved_heading
 
+    @asynccontextmanager
+    async def generation_turn(self) -> AsyncGenerator[None]:
+        """Serialize narration/chat turns and reject overlapping requests immediately."""
+        if self.is_generating or self.lock.locked():
+            raise SessionBusyError("Narration or response generation is already in progress.")
+        async with self.lock:
+            if self.is_generating:
+                raise SessionBusyError("Narration or response generation is already in progress.")
+            self.is_generating = True
+            try:
+                yield
+            finally:
+                self.is_generating = False
+
+    def _snapshot(self, *, last_active_at: float) -> SessionSnapshot:
+        return SessionSnapshot(
+            session_id=self.session_id,
+            client_id=self.client_id,
+            started_at=self.started_at,
+            last_active_at=last_active_at,
+            last_trigger_location=self.last_trigger_location,
+            last_trigger_time=self.last_trigger_time,
+            last_audio_ended_at=self.last_audio_ended_at,
+            used_lens_ids=list(self.used_lens_ids),
+        )
+
     async def run_gemini_turn(
         self,
         config: AppConfig,
         user_prompt_text: str,
-    ) -> tuple[GeminiTextResult, str | None, float, int, int | None]:
+    ) -> TurnResult:
         """Run a Gemini text + optional TTS turn and append it to session history."""
         if self._gemini is None:
             raise RuntimeError("WalkSession requires a GeminiClient to run generation turns.")
@@ -302,7 +344,13 @@ class WalkSession:
         if audio_url is None:
             self.last_audio_ended_at = now
 
-        return llm_result, audio_url, now, llm_latency_ms, tts_latency_ms
+        return TurnResult(
+            llm=llm_result,
+            audio_url=audio_url,
+            timestamp=now,
+            llm_latency_ms=llm_latency_ms,
+            tts_latency_ms=tts_latency_ms,
+        )
 
     def sample_lens(self, config: AppConfig, requested_lens_id: str | None = None) -> LensConfig:
         all_lenses = config.lenses
@@ -435,6 +483,59 @@ class WalkSession:
             "through the selected lens."
         )
 
+    @staticmethod
+    def _build_assistant_message(
+        *,
+        msg_type: Literal["narration", "chat_reply"],
+        config: AppConfig,
+        turn: TurnResult,
+        location: MessageLocation | None = None,
+        lens: LensSummary | None = None,
+        reason: str | None = None,
+    ) -> AssistantMessage:
+        return AssistantMessage(
+            id=uuid.uuid4().hex[:10],
+            type=msg_type,
+            timestamp=turn.timestamp,
+            location=location,
+            lens=lens,
+            reason=reason,
+            model=config.gemini.model,
+            text=turn.llm.text,
+            audio_url=turn.audio_url,
+            sources=turn.llm.sources,
+            search_queries=turn.llm.search_queries,
+        )
+
+    async def _log_turn_completed(
+        self,
+        event_type: BackendEventType,
+        *,
+        config: AppConfig,
+        message: AssistantMessage,
+        turn: TurnResult,
+        short_label: str | None,
+        **extra: Any,
+    ) -> None:
+        usage_payload = turn.llm.usage.model_dump(exclude_none=True) if turn.llm.usage else {}
+        await self._events.log_async(
+            event_type,
+            session_id=self.session_id,
+            client_id=self.client_id,
+            message_id=message.id,
+            model=config.gemini.model,
+            thinking_level=config.gemini.thinking_level,
+            short_label=short_label,
+            word_count=len(turn.llm.text.split()),
+            has_audio=turn.audio_url is not None,
+            source_count=len(turn.llm.sources),
+            search_query_count=len(turn.llm.search_queries),
+            llm_latency_ms=turn.llm_latency_ms,
+            tts_latency_ms=turn.tts_latency_ms,
+            **extra,
+            **usage_payload,
+        )
+
     async def execute_narration_turn(
         self,
         config: AppConfig,
@@ -455,72 +556,43 @@ class WalkSession:
             lens=lens,
             custom_focus=custom_focus,
         )
-        llm_result, audio_url, now, llm_latency_ms, tts_latency_ms = await self.run_gemini_turn(
-            config, location_prompt
-        )
+        turn = await self.run_gemini_turn(config, location_prompt)
 
         self.last_trigger_location = TriggerLocation(
             lat=lat,
             lon=lon,
             short_label=geo.short_label,
-            timestamp=now,
+            timestamp=turn.timestamp,
         )
 
-        msg_record = AssistantMessage(
-            id=uuid.uuid4().hex[:10],
-            type="narration",
-            timestamp=now,
-            location=MessageLocation(
-                lat=lat,
-                lon=lon,
-                short_label=geo.short_label,
-            ),
+        msg_record = self._build_assistant_message(
+            msg_type="narration",
+            config=config,
+            turn=turn,
+            location=MessageLocation(lat=lat, lon=lon, short_label=geo.short_label),
             lens=LensSummary(id=lens.id, name=lens.name),
             reason=reason,
-            model=config.gemini.model,
-            text=llm_result.text,
-            audio_url=audio_url,
-            sources=llm_result.sources,
-            search_queries=llm_result.search_queries,
         )
         self.ui_messages.append(msg_record)
         if self._store is not None:
             await asyncio.to_thread(
                 self._store.save_narration_turn,
-                session_id=self.session_id,
-                client_id=self.client_id,
-                started_at=self.started_at,
-                last_active_at=now,
-                last_trigger_location=self.last_trigger_location,
-                last_trigger_time=self.last_trigger_time,
-                last_audio_ended_at=self.last_audio_ended_at,
-                used_lens_ids=self.used_lens_ids,
+                session=self._snapshot(last_active_at=turn.timestamp),
                 message=msg_record,
                 prompt_text=location_prompt,
-                llm_latency_ms=llm_latency_ms,
-                tts_latency_ms=tts_latency_ms,
+                llm_latency_ms=turn.llm_latency_ms,
+                tts_latency_ms=turn.tts_latency_ms,
             )
-        usage_payload = llm_result.usage.model_dump(exclude_none=True) if llm_result.usage else {}
-        await self._events.log_async(
+        await self._log_turn_completed(
             BackendEventType.NARRATION_COMPLETED,
-            session_id=self.session_id,
-            client_id=self.client_id,
-            persist=self._store is not None,
-            message_id=msg_record.id,
+            config=config,
+            message=msg_record,
+            turn=turn,
+            short_label=geo.short_label,
             reason=reason,
             lens_id=lens.id,
-            model=config.gemini.model,
-            thinking_level=config.gemini.thinking_level,
-            short_label=geo.short_label,
             lat=round(lat, 5),
             lon=round(lon, 5),
-            word_count=len(llm_result.text.split()),
-            has_audio=audio_url is not None,
-            source_count=len(llm_result.sources),
-            search_query_count=len(llm_result.search_queries),
-            llm_latency_ms=llm_latency_ms,
-            tts_latency_ms=tts_latency_ms,
-            **usage_payload,
         )
         return msg_record
 
@@ -544,63 +616,39 @@ class WalkSession:
             text=cleaned_message,
         )
         user_prompt_text = f"{loc_prefix}User message: {cleaned_message}"
-        llm_result, audio_url, now, llm_latency_ms, tts_latency_ms = await self.run_gemini_turn(
-            config, user_prompt_text
-        )
+        turn = await self.run_gemini_turn(config, user_prompt_text)
 
-        assistant_msg_ui = AssistantMessage(
-            id=uuid.uuid4().hex[:10],
-            type="chat_reply",
-            timestamp=now,
-            location=(
-                MessageLocation(lat=lat, lon=lon, short_label=short_label)
-                if short_label and lat is not None and lon is not None
-                else None
-            ),
-            model=config.gemini.model,
-            text=llm_result.text,
-            audio_url=audio_url,
-            sources=llm_result.sources,
-            search_queries=llm_result.search_queries,
+        location = (
+            MessageLocation(lat=lat, lon=lon, short_label=short_label)
+            if short_label and lat is not None and lon is not None
+            else None
+        )
+        assistant_msg_ui = self._build_assistant_message(
+            msg_type="chat_reply",
+            config=config,
+            turn=turn,
+            location=location,
         )
         self.ui_messages.append(user_msg_ui)
         self.ui_messages.append(assistant_msg_ui)
         if self._store is not None:
             await asyncio.to_thread(
                 self._store.save_chat_turn,
-                session_id=self.session_id,
-                client_id=self.client_id,
-                started_at=self.started_at,
-                last_active_at=now,
-                last_trigger_location=self.last_trigger_location,
-                last_trigger_time=self.last_trigger_time,
-                last_audio_ended_at=self.last_audio_ended_at,
-                used_lens_ids=self.used_lens_ids,
+                session=self._snapshot(last_active_at=turn.timestamp),
                 user_message=user_msg_ui,
                 assistant_message=assistant_msg_ui,
                 prompt_text=user_prompt_text,
                 lat=lat,
                 lon=lon,
-                llm_latency_ms=llm_latency_ms,
-                tts_latency_ms=tts_latency_ms,
+                llm_latency_ms=turn.llm_latency_ms,
+                tts_latency_ms=turn.tts_latency_ms,
             )
-        usage_payload = llm_result.usage.model_dump(exclude_none=True) if llm_result.usage else {}
-        await self._events.log_async(
+        await self._log_turn_completed(
             BackendEventType.CHAT_COMPLETED,
-            session_id=self.session_id,
-            client_id=self.client_id,
-            persist=self._store is not None,
-            message_id=assistant_msg_ui.id,
-            model=config.gemini.model,
-            thinking_level=config.gemini.thinking_level,
+            config=config,
+            message=assistant_msg_ui,
+            turn=turn,
             short_label=short_label,
-            word_count=len(llm_result.text.split()),
-            has_audio=audio_url is not None,
-            source_count=len(llm_result.sources),
-            search_query_count=len(llm_result.search_queries),
-            llm_latency_ms=llm_latency_ms,
-            tts_latency_ms=tts_latency_ms,
-            **usage_payload,
         )
         return user_msg_ui, assistant_msg_ui
 

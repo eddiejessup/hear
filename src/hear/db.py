@@ -161,6 +161,18 @@ CREATE TABLE IF NOT EXISTS config_overrides (
 """
 
 
+@dataclass(frozen=True)
+class SessionSnapshot:
+    session_id: str
+    client_id: str
+    started_at: float
+    last_active_at: float
+    last_trigger_location: TriggerLocation | None
+    last_trigger_time: float | None
+    last_audio_ended_at: float | None
+    used_lens_ids: list[str]
+
+
 @dataclass
 class PersistedSessionState:
     session_id: str
@@ -253,17 +265,11 @@ class HearDB:
     @staticmethod
     def _upsert_session_in_tx(
         conn: sqlite3.Connection,
+        session: SessionSnapshot,
         *,
-        session_id: str,
-        client_id: str,
-        started_at: float,
-        last_active_at: float,
-        is_active: bool,
-        last_trigger_location: TriggerLocation | None,
-        last_trigger_time: float | None,
-        last_audio_ended_at: float | None,
-        used_lens_ids: list[str],
+        is_active: bool = True,
     ) -> None:
+        trig_loc = session.last_trigger_location
         conn.execute(
             """
             INSERT INTO sessions (
@@ -282,19 +288,19 @@ class HearDB:
                 used_lens_ids_json = excluded.used_lens_ids_json
             """,
             (
-                session_id,
-                client_id,
-                started_at,
-                last_active_at,
+                session.session_id,
+                session.client_id,
+                session.started_at,
+                session.last_active_at,
                 1 if is_active else 0,
-                last_trigger_location.lat if last_trigger_location else None,
-                last_trigger_location.lon if last_trigger_location else None,
-                last_trigger_location.short_label if last_trigger_location else None,
-                last_trigger_time
-                if last_trigger_time is not None
-                else (last_trigger_location.timestamp if last_trigger_location else None),
-                last_audio_ended_at,
-                json.dumps(used_lens_ids),
+                trig_loc.lat if trig_loc else None,
+                trig_loc.lon if trig_loc else None,
+                trig_loc.short_label if trig_loc else None,
+                session.last_trigger_time
+                if session.last_trigger_time is not None
+                else (trig_loc.timestamp if trig_loc else None),
+                session.last_audio_ended_at,
+                json.dumps(session.used_lens_ids),
             ),
         )
 
@@ -327,14 +333,7 @@ class HearDB:
     def save_narration_turn(
         self,
         *,
-        session_id: str,
-        client_id: str,
-        started_at: float,
-        last_active_at: float,
-        last_trigger_location: TriggerLocation | None,
-        last_trigger_time: float | None,
-        last_audio_ended_at: float | None,
-        used_lens_ids: list[str],
+        session: SessionSnapshot,
         message: AssistantMessage,
         prompt_text: str,
         llm_latency_ms: int | None = None,
@@ -347,22 +346,11 @@ class HearDB:
         with self._lock:
             conn = self._connect()
             with conn:
-                self._upsert_session_in_tx(
-                    conn,
-                    session_id=session_id,
-                    client_id=client_id,
-                    started_at=started_at,
-                    last_active_at=last_active_at,
-                    is_active=True,
-                    last_trigger_location=last_trigger_location,
-                    last_trigger_time=last_trigger_time,
-                    last_audio_ended_at=last_audio_ended_at,
-                    used_lens_ids=used_lens_ids,
-                )
+                self._upsert_session_in_tx(conn, session, is_active=True)
                 self._insert_assistant_message_in_tx(
                     conn,
-                    session_id=session_id,
-                    client_id=client_id,
+                    session_id=session.session_id,
+                    client_id=session.client_id,
                     message=message,
                     prompt_text=prompt_text,
                     llm_latency_ms=llm_latency_ms,
@@ -376,14 +364,7 @@ class HearDB:
     def save_chat_turn(
         self,
         *,
-        session_id: str,
-        client_id: str,
-        started_at: float,
-        last_active_at: float,
-        last_trigger_location: TriggerLocation | None,
-        last_trigger_time: float | None,
-        last_audio_ended_at: float | None,
-        used_lens_ids: list[str],
+        session: SessionSnapshot,
         user_message: UserChatMessage,
         assistant_message: AssistantMessage,
         prompt_text: str,
@@ -395,18 +376,7 @@ class HearDB:
         with self._lock:
             conn = self._connect()
             with conn:
-                self._upsert_session_in_tx(
-                    conn,
-                    session_id=session_id,
-                    client_id=client_id,
-                    started_at=started_at,
-                    last_active_at=last_active_at,
-                    is_active=True,
-                    last_trigger_location=last_trigger_location,
-                    last_trigger_time=last_trigger_time,
-                    last_audio_ended_at=last_audio_ended_at,
-                    used_lens_ids=used_lens_ids,
-                )
+                self._upsert_session_in_tx(conn, session, is_active=True)
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO messages (
@@ -416,8 +386,8 @@ class HearDB:
                     """,
                     (
                         user_message.id,
-                        session_id,
-                        client_id,
+                        session.session_id,
+                        session.client_id,
                         user_message.role,
                         user_message.type,
                         user_message.timestamp,
@@ -430,8 +400,8 @@ class HearDB:
                 )
                 self._insert_assistant_message_in_tx(
                     conn,
-                    session_id=session_id,
-                    client_id=client_id,
+                    session_id=session.session_id,
+                    client_id=session.client_id,
                     message=assistant_message,
                     prompt_text=None,
                     llm_latency_ms=llm_latency_ms,
