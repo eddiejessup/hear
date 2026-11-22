@@ -44,12 +44,12 @@ fi
 echo "▸ Running type checker (ty check)..."
 $TY check
 
-if [[ -x ".venv/bin/python" ]] && .venv/bin/python -V >/dev/null 2>&1; then
+if [[ -x ".venv/bin/pytest" ]] && .venv/bin/pytest --version >/dev/null 2>&1; then
   echo "▸ Running unit tests..."
-  .venv/bin/python -m unittest discover -s tests -v
-elif command -v uv >/dev/null 2>&1 && uv run python -V >/dev/null 2>&1; then
+  .venv/bin/pytest -v
+elif command -v uv >/dev/null 2>&1 && uv run pytest --version >/dev/null 2>&1; then
   echo "▸ Running unit tests..."
-  uv run python -m unittest discover -s tests -v
+  uv run pytest -v
 fi
 
 echo "✓ All static analysis checks passed."
