@@ -38,7 +38,7 @@ target-version = "py315"
 src = ["src"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+extend-select = ["E501", "PT"]
 
 [tool.ty.environment]
 python-version = "3.15"

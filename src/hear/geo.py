@@ -31,7 +31,7 @@ def compass_bearing_label(heading: float | None) -> str | None:
         return None
     dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
     idx = round(heading / 45.0) % 8
-    deg = int(round(heading)) % 360
+    deg = round(heading) % 360
     return f"{dirs[idx]} ({deg}°)"
 
 
