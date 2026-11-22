@@ -10,33 +10,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-export PATH="/opt/homebrew/bin:/opt/homebrew/share/google-cloud-sdk/bin:$PATH"
+# 1. Load .env, GCP defaults, and required secrets
+# shellcheck disable=SC1091
+source "$ROOT_DIR/deploy/_common.sh"
 
-# 1. Load .env (before applying defaults so .env overrides work)
-if [[ -f ".env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source ".env"
-  set +a
-fi
-
-PROJECT="${GCP_PROJECT:-gen-lang-client-0743073374}"
-REGION="${GCP_REGION:-europe-west1}"
-LITESTREAM_BUCKET="${HEAR_LITESTREAM_BUCKET:-${PROJECT}-hear-data}"
 GH_REPO="${GH_REPO:-eddiejessup/hear}"
 SA_NAME="github-deployer"
 SA_EMAIL="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 
-if [[ -z "${GEMINI_API_KEY:-}" ]]; then
-  echo "✗ Error: GEMINI_API_KEY must be set in .env" >&2
-  exit 1
-fi
-
-if [[ -z "${HEAR_AUTH_TOKEN:-}" ]]; then
-  HEAR_AUTH_TOKEN="$(openssl rand -hex 24)"
-  echo "HEAR_AUTH_TOKEN=\"$HEAR_AUTH_TOKEN\"" >> .env
-  echo "▸ Generated new HEAR_AUTH_TOKEN and saved it to .env"
-fi
+ensure_deploy_secrets
 
 echo "▸ Enabling required GCP APIs on project '$PROJECT'..."
 gcloud services enable \
